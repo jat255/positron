@@ -5,6 +5,7 @@ requires-python = ">=3.9"
 dependencies = [
     "bokeh",
     "databricks-sql-connector[pyarrow] ; python_full_version < '3.15'",
+    "dask[array]",
     "duckdb ; python_full_version < '3.15'",
     "fastcore",
     "geopandas",
@@ -41,4 +42,5 @@ dependencies = [
     "sqlalchemy",
     "syrupy",
     "torch ; python_full_version < '3.15'",
+    "xarray",
 ]

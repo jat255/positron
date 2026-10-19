@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     import numpy as np
     import pandas as pd
     import polars as pl
+    import xarray as xr
 
     # temporary suppress for python 3.12
     with contextlib.suppress(ImportError):
@@ -1399,7 +1400,260 @@ class IbisExprInspector(PositronInspector["ibis.Expr"]):
         return get_qualname(self.value)
 
 
+#
+# xarray
+#
+
+_NONE_TEXT = "(none)"
+
+_BYTE_UNITS = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+
+
+def _format_nbytes(n: int) -> str:
+    """Format a byte count with binary units, using one decimal above bytes."""
+    if n < 1024:
+        return f"{n} B"
+    size = float(n)
+    unit = 0
+    while size >= 1024 and unit < len(_BYTE_UNITS) - 1:
+        size /= 1024
+        unit += 1
+    return f"{size:.1f} {_BYTE_UNITS[unit]}"
+
+
+def _format_name_list(names: Iterable[Any], *, level: int = 0) -> tuple[str, bool]:
+    """Join names with commas, truncating long lists."""
+    return _maybe_truncate_string(", ".join(str(name) for name in names), level=level)
+
+
+class MetadataRow:
+    """A leaf row of descriptive text shown as a child of an array-like object."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class ArrayGroup:
+    """A group row (for example Coordinates) shown as a child of an array-like object."""
+
+    COORDINATES = "Coordinates"
+    DATA_VARIABLES = "Data variables"
+    ATTRIBUTES = "Attributes"
+    VALUES = "Values"
+
+    def __init__(self, name: str, owner: Any) -> None:
+        self.name = name
+        self.owner = owner
+
+
+class MetadataRowInspector(PositronInspector[MetadataRow]):
+    def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:  # noqa: ARG002
+        return self.value.text, False
+
+    def get_display_type(self) -> str:
+        return ""
+
+    def get_kind(self) -> str:
+        return "other"
+
+    def get_length(self) -> int:
+        return 0
+
+    def has_children(self) -> bool:
+        return False
+
+    def is_mutable(self) -> bool:
+        return False
+
+
+def _array_values_preview(da: xr.DataArray, *, level: int = 0) -> tuple[str, bool]:
+    """Preview the values of an eager DataArray."""
+    text = _numpy().array2string(da.values, threshold=100, edgeitems=3)
+    return _maybe_truncate_string(" ".join(text.split()), level=level)
+
+
+class ArrayGroupInspector(PositronInspector[ArrayGroup]):
+    def _names(self) -> list[Any]:
+        group = self.value
+        if group.name == ArrayGroup.COORDINATES:
+            return list(group.owner.coords)
+        if group.name == ArrayGroup.DATA_VARIABLES:
+            return list(group.owner.data_vars)
+        if group.name == ArrayGroup.ATTRIBUTES:
+            return list(group.owner.attrs)
+        return []
+
+    def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
+        if self.value.name == ArrayGroup.VALUES:
+            return _array_values_preview(self.value.owner, level=level)
+        names = self._names()
+        if not names:
+            return _NONE_TEXT, False
+        return _format_name_list(names, level=level)
+
+    def get_display_type(self) -> str:
+        return ""
+
+    def get_kind(self) -> str:
+        return "other"
+
+    def get_length(self) -> int:
+        return len(self._names())
+
+    def has_children(self) -> bool:
+        return self.get_length() > 0
+
+    def get_children(self) -> list[Any]:
+        return self._names()
+
+    def has_child(self, key: Any) -> bool:
+        return key in self._names()
+
+    def get_child(self, key: Any) -> Any:
+        group = self.value
+        if group.name == ArrayGroup.COORDINATES:
+            return group.owner.coords[key]
+        if group.name == ArrayGroup.DATA_VARIABLES:
+            return group.owner[key]
+        if group.name == ArrayGroup.ATTRIBUTES:
+            return group.owner.attrs[key]
+        raise KeyError(key)
+
+    def is_mutable(self) -> bool:
+        return False
+
+
+class XarrayDatasetInspector(PositronInspector["xr.Dataset"]):
+    CLASS_QNAME = ("xarray.core.dataset.Dataset", "xarray.Dataset")
+
+    DIMENSIONS = "Dimensions"
+    INDEXES = "Indexes"
+
+    def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
+        ds = self.value
+        text = f"[{len(ds.sizes)} dims x {len(ds.data_vars)} vars] xarray.Dataset"
+        return _maybe_truncate_string(text, level=level)[0], True
+
+    def get_display_type(self) -> str:
+        ds = self.value
+        return f"Dataset [{len(ds.sizes)} dims x {len(ds.data_vars)} vars]"
+
+    def get_kind(self) -> str:
+        return "table"
+
+    def get_length(self) -> int:
+        return len(self.value.data_vars)
+
+    def get_size(self) -> int:
+        return self.value.nbytes
+
+    def has_children(self) -> bool:
+        return True
+
+    def get_children(self) -> list[str]:
+        return [
+            self.DIMENSIONS,
+            ArrayGroup.COORDINATES,
+            ArrayGroup.DATA_VARIABLES,
+            self.INDEXES,
+            ArrayGroup.ATTRIBUTES,
+        ]
+
+    def has_child(self, key: Any) -> bool:
+        return key in self.get_children()
+
+    def get_child(self, key: Any) -> Any:
+        ds = self.value
+        if key == self.DIMENSIONS:
+            text = ", ".join(f"{dim}: {size}" for dim, size in ds.sizes.items())
+            return MetadataRow(text or _NONE_TEXT)
+        if key == self.INDEXES:
+            return MetadataRow(", ".join(str(name) for name in ds.indexes) or _NONE_TEXT)
+        if key in (ArrayGroup.COORDINATES, ArrayGroup.DATA_VARIABLES, ArrayGroup.ATTRIBUTES):
+            return ArrayGroup(key, ds)
+        raise KeyError(key)
+
+    def get_comparison_cost(self) -> int:
+        return self.value.nbytes
+
+    def equals(self, value: xr.Dataset) -> bool:
+        return type(value) is type(self.value) and self.value.identical(value)
+
+    def deepcopy(self) -> xr.Dataset:
+        return self.value.copy(deep=True)
+
+    def to_html(self) -> str:
+        return self.value._repr_html_()
+
+    def to_plaintext(self) -> str:
+        return repr(self.value)
+
+
+class XarrayDataArrayInspector(PositronInspector["xr.DataArray"]):
+    CLASS_QNAME = ("xarray.core.dataarray.DataArray", "xarray.DataArray")
+
+    def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
+        da = self.value
+        if da.ndim == 0:
+            shape = "scalar"
+        else:
+            shape = " x ".join(f"{dim}: {size}" for dim, size in zip(da.dims, da.shape))
+        return _maybe_truncate_string(f"[{shape}] xarray.DataArray", level=level)[0], True
+
+    def get_display_type(self) -> str:
+        da = self.value
+        return f"DataArray [{'x'.join(str(size) for size in da.shape)}] {da.dtype}"
+
+    def get_kind(self) -> str:
+        return "table"
+
+    def get_length(self) -> int:
+        return int(self.value.shape[0]) if self.value.ndim > 0 else 0
+
+    def get_size(self) -> int:
+        return self.value.nbytes
+
+    def has_children(self) -> bool:
+        da = self.value
+        return not (da.ndim == 0 and len(da.coords) == 0 and len(da.attrs) == 0)
+
+    def get_children(self) -> list[str]:
+        children = [ArrayGroup.COORDINATES, ArrayGroup.ATTRIBUTES]
+        # A chunked (dask) array has no values preview, since building one would compute.
+        if self.value.chunks is None:
+            children.append(ArrayGroup.VALUES)
+        return children
+
+    def has_child(self, key: Any) -> bool:
+        return key in self.get_children()
+
+    def get_child(self, key: Any) -> Any:
+        if key in self.get_children():
+            return ArrayGroup(key, self.value)
+        raise KeyError(key)
+
+    def get_comparison_cost(self) -> int:
+        return self.value.nbytes
+
+    def equals(self, value: xr.DataArray) -> bool:
+        return type(value) is type(self.value) and self.value.identical(value)
+
+    def deepcopy(self) -> xr.DataArray:
+        return self.value.copy(deep=True)
+
+    def to_html(self) -> str:
+        return self.value._repr_html_()
+
+    def to_plaintext(self) -> str:
+        return repr(self.value)
+
+
 INSPECTOR_CLASSES: dict[str, type[PositronInspector]] = {
+    # xarray inspectors and their child rows
+    **dict.fromkeys(XarrayDatasetInspector.CLASS_QNAME, XarrayDatasetInspector),
+    **dict.fromkeys(XarrayDataArrayInspector.CLASS_QNAME, XarrayDataArrayInspector),
+    get_qualname(MetadataRow): MetadataRowInspector,
+    get_qualname(ArrayGroup): ArrayGroupInspector,
     # Geopandas inspectors (before pandas to take precedence)
     **dict.fromkeys(GeoDataFrameInspector.CLASS_QNAME, GeoDataFrameInspector),
     **dict.fromkeys(GeoSeriesInspector.CLASS_QNAME, GeoSeriesInspector),

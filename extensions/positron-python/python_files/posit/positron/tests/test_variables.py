@@ -999,3 +999,19 @@ async def test_shutdown(variables_service: VariablesService, variables_comm: Dum
 
     # Comm is closed
     assert variables_comm._closed  # noqa: SLF001
+
+
+def test_inspect_xarray_dataset_group_paths(
+    shell: PositronShell, variables_comm: DummyComm
+) -> None:
+    pytest.importorskip("xarray")
+    from .test_inspectors_xarray import make_dataset
+
+    shell.user_ns["ds"] = make_dataset()
+
+    children = _do_inspect(
+        [encode_access_key("ds"), encode_access_key("Data variables")], variables_comm
+    )
+    assert [child.display_name for child in children] == ["sst", "anom"]
+    for child in children:
+        assert child.display_value.startswith("[time: 4 x lat: 3 x lon: 5]")
