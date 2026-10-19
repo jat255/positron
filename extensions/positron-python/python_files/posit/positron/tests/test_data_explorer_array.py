@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+import logging
+import sys
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pandas as pd
@@ -17,22 +19,25 @@ from ..data_explorer import (
     _VALUE_NAN,
     _VALUE_NAT,
     _VALUE_NEGINF,
-    ARRAY_VIEW_MAX_DASK_BYTES,
+    ARRAY_VIEW_MAX_LAZY_BYTES,
     ArrayView,
     DataExplorerService,
+    _array_view_unavailable_message,
+    _ArrayTable,
     _value_type_is_supported,
 )
 from ..data_explorer_comm import SupportStatus
+from ..inspectors import get_inspector
 from ..utils import guid
 from . import test_data_explorer
 from .test_data_explorer import (
+    _check_update_variable,
     _get_frequency_table,
     _get_histogram,
     _get_null_count,
     _profile_request,
 )
-from .test_inspectors_xarray import make_dataset
-from .utils import json_rpc_request
+from .utils import json_rpc_request, make_dataset
 
 if TYPE_CHECKING:
     from .conftest import DummyComm
@@ -181,7 +186,7 @@ def test_value_type_is_supported_arrays():
     dask_array = pytest.importorskip("dask.array")
     assert _value_type_is_supported(dask_array.zeros((10, 10)))
     big = dask_array.zeros((6000, 6000))  # 288 MB, never computed
-    assert big.nbytes > ARRAY_VIEW_MAX_DASK_BYTES
+    assert big.nbytes > ARRAY_VIEW_MAX_LAZY_BYTES
     assert not _value_type_is_supported(big)
 
 
@@ -283,3 +288,200 @@ def test_array_view_features():
     assert f.search_schema.support_status == SupportStatus.Unsupported
     assert f.export_data_selection.support_status == SupportStatus.Unsupported
     assert f.convert_to_code.support_status == SupportStatus.Unsupported
+
+
+#
+# Lazily indexed (not dask) DataArrays, such as variables opened from a file without chunks
+#
+
+
+def _lazily_indexed_dataarray(shape: tuple[int, int], dtype: Any, values: Any = None) -> Any:
+    """A 2-D DataArray read lazily from a backend. Without values, any read fails the test."""
+    xr = pytest.importorskip("xarray")
+    from xarray.backends import BackendArray
+    from xarray.core import indexing
+
+    class LazyBackendArray(BackendArray):
+        def __init__(self) -> None:
+            self.shape = shape
+            self.dtype = np.dtype(dtype)
+
+        def __getitem__(self, key: Any) -> np.ndarray:
+            return indexing.explicit_indexing_adapter(
+                key, self.shape, indexing.IndexingSupport.BASIC, self._raw_getitem
+            )
+
+        def _raw_getitem(self, key: tuple) -> np.ndarray:
+            if values is None:
+                raise AssertionError("the lazily indexed array was read")
+            return values[key]
+
+    variable = xr.Variable(("y", "x"), indexing.LazilyIndexedArray(LazyBackendArray()))
+    return xr.DataArray(variable, name="z")
+
+
+def test_lazily_indexed_dataarray_over_limit_is_not_viewable():
+    # 40000 x 40000 float32 is 6.4 GB on disk, never read
+    da = _lazily_indexed_dataarray((40000, 40000), "float32")
+    assert da.nbytes > ARRAY_VIEW_MAX_LAZY_BYTES
+    assert not _value_type_is_supported(da)
+    assert not get_inspector(da).has_viewer()
+    with pytest.raises(TypeError):
+        _ArrayTable.from_value(da)
+
+
+def test_lazily_indexed_dataarray_under_limit_opens(dxf: DataExplorerFixture):
+    values = np.arange(6.0).reshape(2, 3)
+    da = _lazily_indexed_dataarray((2, 3), values.dtype, values)
+    assert _value_type_is_supported(da)
+    assert get_inspector(da).has_viewer()
+    dxf.register_table("lazy", da)
+    assert _column_values(dxf, "lazy", 1, 2) == ["1.00", "4.00"]
+
+
+#
+# Variable updates of an open array explorer
+#
+
+
+def test_array_view_update_same_schema_is_data_update(dxf: DataExplorerFixture):
+    dxf.assign_and_open_viewer("arr", np.zeros((2, 2)))
+    dxf.assign_variable("arr", np.ones((2, 2)))
+    _check_update_variable(dxf.de_service, "arr", update_type="data")
+    assert _column_values(dxf, "arr", 0, 2) == ["1.00", "1.00"]
+
+    da = make_dataset()["sst"].isel(time=0)
+    dxf.assign_and_open_viewer("da", da)
+    dxf.assign_variable("da", da + 1)
+    _check_update_variable(dxf.de_service, "da", update_type="data")
+
+
+def test_array_view_update_changed_schema_is_schema_update(dxf: DataExplorerFixture):
+    dxf.assign_and_open_viewer("arr", np.zeros((2, 2)))
+    dxf.assign_variable("arr", np.zeros((3, 2)))
+    _check_update_variable(dxf.de_service, "arr", update_type="schema")
+    dxf.assign_variable("arr", np.arange(6, dtype="int64").reshape(3, 2))
+    _check_update_variable(dxf.de_service, "arr", update_type="schema")
+    dxf.assign_variable("arr", np.arange(12, dtype="int64").reshape(3, 4))
+    _check_update_variable(dxf.de_service, "arr", update_type="schema")
+
+    da = make_dataset()["sst"].isel(time=0)
+    dxf.assign_and_open_viewer("da", da)
+    # Same shape and dtype, different row labels
+    dxf.assign_variable("da", da.assign_coords(lat=da.lat + 1))
+    _check_update_variable(dxf.de_service, "da", update_type="schema")
+
+
+#
+# Messages for arrays the Data Explorer cannot show
+#
+
+
+def test_array_view_unavailable_message():
+    ds = make_dataset()
+    assert _array_view_unavailable_message(ds, "ds") == (
+        "ds is an xarray Dataset; view one of its variables, e.g. %view ds.sst"
+    )
+    assert _array_view_unavailable_message(ds["sst"], "ds.sst") == (
+        "ds.sst has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. ds.sst.isel(time=0)"
+    )
+    assert _array_view_unavailable_message(np.zeros((2, 2, 2)), "arr") == (
+        "arr has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. arr[0]"
+    )
+    assert _array_view_unavailable_message(np.zeros((2, 2)), "arr") is None
+    assert _array_view_unavailable_message(object(), "x") is None
+
+    da = _lazily_indexed_dataarray((40000, 40000), "float32")
+    assert _array_view_unavailable_message(da, "z") == (
+        "z is 6.0 GiB (not in memory), over the 100.0 MiB limit for the Data Explorer. "
+        "Select a smaller slice or call .compute() first."
+    )
+
+    dask_array = pytest.importorskip("dask.array")
+    assert _array_view_unavailable_message(dask_array.zeros((2, 2, 2)), "lazy") == (
+        "lazy has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. lazy[0]"
+    )
+    big = dask_array.zeros((6000, 6000))
+    assert _array_view_unavailable_message(big, "big") == (
+        "big is 274.7 MiB (not in memory), over the 100.0 MiB limit for the Data Explorer. "
+        "Select a smaller slice or call .compute() first."
+    )
+
+
+#
+# Structured dtypes and datetime labels
+#
+
+
+def test_structured_array_is_not_viewable():
+    arr = np.zeros(3, dtype=[("a", "i4"), ("b", "f8")])
+    assert not _value_type_is_supported(arr)
+    assert not get_inspector(arr).has_viewer()
+
+
+def test_array_view_datetime_labels(dxf: DataExplorerFixture):
+    da = make_dataset()["sst"].isel(lat=0)  # dims (time, lon)
+    dxf.register_table("rows", da)
+    assert _row_labels(dxf, "rows", 2)[:2] == ["2020-01-01 00:00:00", "2020-01-02 00:00:00"]
+
+    dxf.register_table("cols", da.transpose("lon", "time"))
+    columns = [c["column_name"] for c in dxf.get_schema("cols")]
+    assert columns[:2] == ["2020-01-01 00:00:00", "2020-01-02 00:00:00"]
+
+
+#
+# Object columns
+#
+
+
+def test_array_view_object_nulls(dxf: DataExplorerFixture):
+    arr = np.array(["a", None, "b", np.nan], dtype=object)
+    dxf.register_table("arr", arr)
+    dxf.register_table("df", pd.DataFrame({"0": arr}))
+    result = dxf.get_column_profiles("arr", [_get_null_count(0)])
+    assert result[0]["null_count"] == 2
+    assert result == dxf.get_column_profiles("df", [_get_null_count(0)])
+    # pandas infers a string column here, while every object array column reads as object
+    assert _summary(dxf, "arr", 0)["other_stats"]["num_unique"] == 2
+    assert _summary(dxf, "df", 0)["string_stats"]["num_unique"] == 2
+
+
+def test_array_view_object_frequency_table_by_value(dxf: DataExplorerFixture):
+    arr = np.array([1, "1", 1], dtype=object)
+    dxf.register_table("arr", arr)
+    dxf.register_table("df", pd.DataFrame({"0": arr}))
+    request = _get_frequency_table(0, 5)
+    table = dxf.get_column_profiles("arr", [request])[0]["small_frequency_table"]
+    assert table == {"values": ["1", "1"], "counts": [2, 1], "other_count": 0}
+    assert table == dxf.get_column_profiles("df", [request])[0]["small_frequency_table"]
+    assert _summary(dxf, "arr", 0)["other_stats"]["num_unique"] == 2
+
+
+def test_array_view_object_unorderable_values(dxf: DataExplorerFixture):
+    arr = np.array([1, "a", None, [1, 2], [1, 2], {"k": 1}], dtype=object)
+    dxf.register_table("arr", arr)
+    table = dxf.get_column_profiles("arr", [_get_frequency_table(0, 2)])[0]
+    assert table["small_frequency_table"]["counts"] == [2, 1]
+    assert table["small_frequency_table"]["other_count"] == 2
+    assert _summary(dxf, "arr", 0)["other_stats"]["num_unique"] == 4
+
+
+#
+# Datetime summaries without pandas
+#
+
+
+def test_array_view_datetime_summary_without_pandas(
+    dxf: DataExplorerFixture, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    times = np.array(["2020-01-01", "2020-01-03"], dtype="datetime64[ns]")
+    dxf.register_table("times", times)
+    # A None entry in sys.modules makes `import pandas` raise ImportError
+    monkeypatch.setitem(sys.modules, "pandas", None)
+    with caplog.at_level(logging.WARNING):
+        summary = _summary(dxf, "times", 0)
+    assert summary["type_display"] == "datetime"
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]

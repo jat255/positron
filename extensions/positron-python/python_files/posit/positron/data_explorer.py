@@ -18,6 +18,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Iterable,
     Tuple,
     cast,
 )
@@ -108,7 +109,7 @@ from .data_explorer_comm import (
     TableShape,
     TextSearchType,
 )
-from .inspectors import _dask_nbytes, _dask_variables, _is_dask_array
+from .inspectors import _dask_nbytes, _dask_variables, _format_nbytes, _is_dask_array
 from .positron_comm import CommMessage, PositronComm
 from .third_party import is_ibis, is_pandas, is_polars
 from .utils import BackgroundJobQueue, guid
@@ -2930,28 +2931,106 @@ class IbisView(PandasView):
 # ----------------------------------------------------------------------
 # Array Data Explorer RPC implementations for 1-D and 2-D numpy, xarray, and dask arrays
 
-# Opening an array view loads its values into memory, which computes a dask-backed array.
-# Larger dask-backed arrays have no Data Explorer view.
-ARRAY_VIEW_MAX_DASK_BYTES = 100 * 1024 * 1024
+# Opening an array view loads its values into memory. That computes a dask-backed array and reads
+# a lazily indexed one (for example a variable opened from a file without chunks). Larger arrays
+# that are not already in memory have no Data Explorer view.
+ARRAY_VIEW_MAX_LAZY_BYTES = 100 * 1024 * 1024
 
 
-def _is_viewable_array(value: Any) -> bool:
-    """Whether value is a 1-D or 2-D numpy array, xarray DataArray, or dask array to view."""
+def _is_array(value: Any) -> bool:
+    """Whether value is a numpy array, xarray DataArray, or dask array."""
     np_module = sys.modules.get("numpy")
     xr_module = sys.modules.get("xarray")
-    is_array = (
+    return (
         (np_module is not None and isinstance(value, np_module.ndarray))
         or (xr_module is not None and isinstance(value, xr_module.DataArray))
         or _is_dask_array(value)
     )
-    if not is_array or value.ndim not in (1, 2):
+
+
+def _array_lazy_nbytes(value: Any) -> int | None:
+    """
+    The bytes that opening an array view would load into memory, read from metadata only.
+
+    Returns 0 for an array that is already in memory, and None when the size of a dim is not
+    known until the array is computed.
+    """
+    np_module = sys.modules.get("numpy")
+    if np_module is not None and isinstance(value, np_module.ndarray):
+        return 0
+    dask_sizes = [_dask_nbytes(array) for _, array in _dask_variables(value)]
+    if dask_sizes:
+        if None in dask_sizes:
+            return None
+        return sum(cast("list[int]", dask_sizes))
+    # A DataArray that is not dask-backed. xarray has no public check for whether its data is
+    # loaded, so read Variable._in_memory, and treat the data as lazy if it is missing.
+    if getattr(value.variable, "_in_memory", False):
+        return 0
+    return int(value.nbytes)
+
+
+def _is_viewable_array(value: Any) -> bool:
+    """Whether value is a 1-D or 2-D numpy array, xarray DataArray, or dask array to view."""
+    if not _is_array(value) or value.ndim not in (1, 2):
         return False
-    # Read the size from metadata only, so that this check never computes anything.
-    sizes = [_dask_nbytes(array) for _, array in _dask_variables(value)]
-    if None in sizes:
-        # The size of a dim is not known until the array is computed
+    if value.dtype.names is not None:
+        # Structured dtypes have no single column type
         return False
-    return sum(cast("list[int]", sizes)) <= ARRAY_VIEW_MAX_DASK_BYTES
+    nbytes = _array_lazy_nbytes(value)
+    return nbytes is not None and nbytes <= ARRAY_VIEW_MAX_LAZY_BYTES
+
+
+def _array_view_unavailable_message(value: Any, expr: str) -> str | None:
+    """
+    Explain why the Data Explorer cannot show value, which expr evaluates to.
+
+    Returns None when value is not an array or Dataset, or when the Data Explorer can show it.
+    """
+    xr_module = sys.modules.get("xarray")
+    if xr_module is not None and isinstance(value, xr_module.Dataset):
+        names = list(value.data_vars)
+        if not names:
+            return f"{expr} is an xarray Dataset with no data variables to view"
+        return (
+            f"{expr} is an xarray Dataset; view one of its variables, "
+            f"e.g. %view {_child_expr(expr, names[0])}"
+        )
+    if not _is_array(value):
+        return None
+    if value.ndim > 2:
+        if xr_module is not None and isinstance(value, xr_module.DataArray):
+            dim = value.dims[0]
+            if isinstance(dim, str) and dim.isidentifier():
+                example = f"{expr}.isel({dim}=0)"
+            else:
+                example = f"{expr}.isel({{{dim!r}: 0}})"
+        else:
+            example = f"{expr}[0]"
+        return (
+            f"{expr} has {value.ndim} dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+            f"Select a slice first, e.g. {example}"
+        )
+    if value.ndim in (1, 2):
+        nbytes = _array_lazy_nbytes(value)
+        if nbytes is None:
+            return (
+                f"{expr} has a shape that is not known until it is computed. Call .compute() first."
+            )
+        if nbytes > ARRAY_VIEW_MAX_LAZY_BYTES:
+            return (
+                f"{expr} is {_format_nbytes(nbytes)} (not in memory), over the "
+                f"{_format_nbytes(ARRAY_VIEW_MAX_LAZY_BYTES)} limit for the Data Explorer. "
+                "Select a smaller slice or call .compute() first."
+            )
+    return None
+
+
+def _child_expr(expr: str, name: Any) -> str:
+    """An expression for the variable `name` of the Dataset that expr evaluates to."""
+    if isinstance(name, str) and name.isidentifier():
+        return f"{expr}.{name}"
+    return f"{expr}[{name!r}]"
 
 
 class _ArrayTable:
@@ -2974,6 +3053,7 @@ class _ArrayTable:
         # 2-D boolean array, True where a cell is masked (missing), or None
         self.mask = mask
         self.shape: tuple[int, int] = (values.shape[0], values.shape[1])
+        self.dtype = values.dtype
         self.columns = columns
         self.row_labels = row_labels
         self.dims = dims
@@ -3023,7 +3103,10 @@ class _ArrayTable:
     def _dim_labels(data_array: Any, dim: Any) -> list[str]:
         # Use the dim's coordinate values when it has one, else index positions
         if dim in data_array.coords:
-            return [str(label) for label in data_array.coords[dim].to_numpy()]
+            labels = data_array.coords[dim].to_numpy()
+            # Datetimes read the same as the cells of a datetime column
+            to_str = _datetime64_formatter() if labels.dtype.kind == "M" else str
+            return [to_str(label) for label in labels]
         return [str(i) for i in range(data_array.sizes[dim])]
 
 
@@ -3101,17 +3184,39 @@ def _array_summarize_string(values: np.ndarray, _options: FormatOptions):
     return _box_string_stats(num_empty, len(np.unique(values)))
 
 
-def _array_summarize_object(values: np.ndarray, _options: FormatOptions):
-    import numpy as np
+def _count_objects(values: Iterable[Any]) -> tuple[list[Any], list[int]]:
+    """
+    Count the distinct values of an object column by value equality, in order of first appearance.
 
-    return _box_other_stats(
-        len(np.unique(values.astype(str))), type_display=ColumnDisplayType.Object
-    )
+    Values do not need to be orderable. Unhashable values are grouped by their repr.
+    """
+    counts: dict[Any, int] = {}
+    firsts: dict[Any, Any] = {}
+    for value in values:
+        try:
+            key = (True, value)
+            hash(key)
+        except TypeError:
+            key = (False, type(value), repr(value))
+        if key in counts:
+            counts[key] += 1
+        else:
+            counts[key] = 1
+            firsts[key] = value
+    return list(firsts.values()), list(counts.values())
+
+
+def _array_summarize_object(values: np.ndarray, _options: FormatOptions):
+    return _box_other_stats(len(_count_objects(values)[0]), type_display=ColumnDisplayType.Object)
 
 
 def _array_summarize_datetime(values: np.ndarray, options: FormatOptions):
-    # Reuse the pandas implementation so that formatting matches PandasView
-    import pandas as pd
+    # Reuse the pandas implementation so that formatting matches PandasView. pandas is optional,
+    # so without it the summary has the column type and no stats.
+    try:
+        import pandas as pd
+    except ImportError:
+        return ColumnSummaryStats(type_display=ColumnDisplayType.Datetime)
 
     return _pandas_summarize_datetime(pd.Series(values), options)
 
@@ -3212,11 +3317,18 @@ class ArrayView(DataExplorerTableView):
             state.display_name = f"{self.state.name} ({', '.join(self.table.dims)})"
         return state
 
-    def get_updated_state(self, new_table) -> StateUpdate:  # noqa: ARG002
-        # _update_explorer_for_comm only calls this for _ArrayTable inputs, so variable updates
-        # normally take the full schema-update path.
-        # Any change to an array is treated as a full schema update
-        return True, DataExplorerState(self.state.name)
+    def get_updated_state(self, new_table) -> StateUpdate:
+        # Arrays have no sort keys or filters to carry over. The schema is unchanged when the
+        # shape, dtype, column names, and row labels all match, so only the data needs a refresh.
+        new_table = _ArrayTable.from_value(new_table)
+        old_table = self.table
+        schema_updated = (
+            new_table.shape != old_table.shape
+            or new_table.dtype != old_table.dtype
+            or new_table.columns != old_table.columns
+            or new_table.row_labels != old_table.row_labels
+        )
+        return schema_updated, DataExplorerState(self.state.name)
 
     def _get_mask(self, column_index: int) -> np.ndarray | None:
         mask = self.table.mask
@@ -3231,13 +3343,19 @@ class ArrayView(DataExplorerTableView):
         return self.math_helper.np.ma.array(col, mask=mask)
 
     def _get_valid_values(self, column_index: int) -> np.ndarray:
-        """Return a column's values without masked, NaN, or NaT cells."""
+        """Return a column's values without masked, NaN, NaT, or None cells."""
         np = self.math_helper.np
         col = self._get_column(column_index)
         if isinstance(col, np.ma.MaskedArray):
             col = col.compressed()
         if col.dtype.kind in "fcmM":
             col = col[~np.isnan(col) if col.dtype.kind in "fc" else ~np.isnat(col)]
+        elif col.dtype.kind == "O":
+            # Cells render None and float NaN as missing, so count them as nulls
+            is_float = self.math_helper.is_float_scalar
+            isnan = self.math_helper.isnan
+            valid = [not (x is None or (is_float(x) and isnan(x))) for x in col]
+            col = col[np.asarray(valid, dtype=bool)]
         return col
 
     def _prof_null_count(self, column_index: int) -> int:
@@ -3274,8 +3392,17 @@ class ArrayView(DataExplorerTableView):
         format_options: FormatOptions,
     ) -> ColumnFrequencyTable:
         np = self.math_helper.np
-        values, counts = np.unique(self._get_valid_values(column_index), return_counts=True)
-        # Most frequent first, ties in ascending value order
+        valid = self._get_valid_values(column_index)
+        if valid.dtype.kind == "O":
+            # Objects may not be orderable, and np.unique sorts. Ties keep first appearance.
+            distinct, object_counts = _count_objects(valid)
+            values = np.empty(len(distinct), dtype=object)
+            values[:] = distinct
+            counts = np.asarray(object_counts, dtype=np.int64)
+        else:
+            # Ties in ascending value order
+            values, counts = np.unique(valid, return_counts=True)
+        # Most frequent first
         order = np.argsort(-counts, kind="stable")
         top = order[: params.limit]
         other = order[params.limit :]
@@ -3593,7 +3720,12 @@ class DataExplorerService:
             # looking at invalid.
             return self._close_explorer(comm_id)
 
-        if not isinstance(new_table, type(table_view.table)):
+        if isinstance(table_view, ArrayView) and _is_viewable_array(new_table):
+            # The open view's table is an _ArrayTable, never the user's array type. Load the new
+            # array once, for both the schema comparison and the new view.
+            new_table = _ArrayTable.from_value(new_table)
+            schema_updated, new_state = table_view.get_updated_state(new_table)
+        elif not isinstance(new_table, type(table_view.table)):
             # Data structure type has changed. For now, we drop the
             # entire state: sorting keys, filters, etc. and start
             # over. At some point we can return here and selectively
