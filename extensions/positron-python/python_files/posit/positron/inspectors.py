@@ -52,11 +52,11 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
-    import dask.array as da
     import numpy as np
     import pandas as pd
     import polars as pl
     import xarray as xr
+    from dask.array.core import Array as DaskArray
 
     # temporary suppress for python 3.12
     with contextlib.suppress(ImportError):
@@ -1442,7 +1442,7 @@ def _is_dask_array(value: Any) -> bool:
     return "dask.array" in sys.modules and get_qualname(type(value)) in _DASK_ARRAY_QNAMES
 
 
-def _dask_variables(value: Any) -> list[tuple[tuple[Hashable, ...] | None, da.Array]]:
+def _dask_variables(value: Any) -> list[tuple[tuple[Hashable, ...] | None, DaskArray]]:
     """
     Return `(dims, dask array)` for a dask array or each dask-backed variable of an xarray object.
 
@@ -1475,7 +1475,7 @@ def _is_dask_backed(value: Any) -> bool:
     return bool(_dask_variables(value))
 
 
-def _dask_nbytes(array: da.Array) -> int | None:
+def _dask_nbytes(array: DaskArray) -> int | None:
     """The size of a dask array in bytes, or None when its shape is not known until computed."""
     # A dim's length is NaN when it depends on data that has not been computed
     size = math.prod(array.shape)
@@ -1897,7 +1897,7 @@ class XarrayDataArrayInspector(PositronInspector["xr.DataArray"]):
         return repr(self.value)
 
 
-class DaskArrayInspector(PositronInspector["da.Array"]):
+class DaskArrayInspector(PositronInspector["DaskArray"]):
     CLASS_QNAME = _DASK_ARRAY_QNAMES
 
     def get_display_type(self) -> str:
@@ -1935,11 +1935,11 @@ class DaskArrayInspector(PositronInspector["da.Array"]):
     def get_comparison_cost(self) -> int:
         return 0
 
-    def equals(self, value: da.Array) -> bool:
+    def equals(self, value: DaskArray) -> bool:
         # The name is a token of the array's task graph; changing the array changes it.
         return type(value) is type(self.value) and value.name == self.value.name
 
-    def deepcopy(self) -> da.Array:
+    def deepcopy(self) -> DaskArray:
         # A shallow copy shares the task graph and keeps the name, without computing anything.
         # In-place assignment then gives the original a new name.
         return copy.copy(self.value)

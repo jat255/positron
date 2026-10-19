@@ -165,7 +165,7 @@ def test_xarray_equals_detects_changes():
     copy = ins.deepcopy()
     copy["sst"][0, 0, 0] = 1
     assert not ins.equals(copy)
-    assert not ins.equals(pd.DataFrame({"a": [1]}))  # pyright: ignore[reportArgumentType]
+    assert not ins.equals(pd.DataFrame({"a": [1]}))  # type: ignore
 
     da = make_dataset()["sst"]
     ins = get_inspector(da)
@@ -176,7 +176,7 @@ def test_xarray_equals_detects_changes():
     copy = ins.deepcopy()
     copy[0, 0, 0] = 1
     assert not ins.equals(copy)
-    assert not ins.equals(pd.DataFrame({"a": [1]}))  # pyright: ignore[reportArgumentType]
+    assert not ins.equals(pd.DataFrame({"a": [1]}))  # type: ignore
 
 
 def test_xarray_comparison_cost():
