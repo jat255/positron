@@ -1001,7 +1001,7 @@ def test_query_table_summary_xarray(
     assert len(profiles) == 3
     for profile in profiles:
         assert profile["summary_stats"]["number_stats"] is not None
-    assert not [r for r in caplog.records if "nsupported" in r.getMessage()]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 def test_unknown_method(variables_comm: DummyComm) -> None:
