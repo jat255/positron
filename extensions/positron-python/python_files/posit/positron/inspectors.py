@@ -1543,14 +1543,19 @@ def _attrs_equal(a: Mapping[Any, Any], b: Mapping[Any, Any]) -> bool:
         return False
 
 
+# The key of a DataArray's own data in `_xarray_variables`. Any hashable, None included, can name
+# an xarray variable, so the key is an object that no user code can pass.
+_OWN_DATA_KEY = object()
+
+
 def _xarray_variables(value: xr.Dataset | xr.DataArray) -> dict[Hashable, xr.Variable]:
-    """Every variable of an xarray object, with a DataArray's own data keyed by None."""
+    """Every variable of an xarray object, with a DataArray's own data keyed by `_OWN_DATA_KEY`."""
     if hasattr(value, "data_vars"):
         return dict(value.variables)
     variables: dict[Hashable, xr.Variable] = {
         name: coord.variable for name, coord in value.coords.items()
     }
-    variables[None] = value.variable
+    variables[_OWN_DATA_KEY] = value.variable
     return variables
 
 
@@ -1609,7 +1614,7 @@ def _xarray_lazy_copy(value: Any) -> Any:
     for name, variable in _xarray_variables(out).items():
         if variable.chunks is not None and _is_dask_array(variable.data):
             variable.data = copy.copy(variable.data)
-        elif name is not None and not isinstance(variable, index_variable):
+        elif name is not _OWN_DATA_KEY and not isinstance(variable, index_variable):
             owned = variable.copy(deep=True)
             if name in out.coords:
                 out.coords[name] = owned

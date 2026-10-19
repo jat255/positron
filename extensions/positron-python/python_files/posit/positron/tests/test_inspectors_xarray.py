@@ -440,3 +440,14 @@ def test_dask_comparison_cost_counts_eager_data_variables():
     ds = make_mixed_lazy_dataset()
     eager = ("time", "lat", "lon", "depth", "mask")
     assert get_inspector(ds).get_comparison_cost() == sum(ds[name].nbytes for name in eager)
+
+
+def test_dask_equals_detects_in_place_edit_of_eager_variable_named_none():
+    # None is a valid Dataset variable name; it must still get its own copy in the snapshot.
+    # make_lazy_dataset's dask variables fail the test if anything computes them.
+    ds = make_lazy_dataset()
+    ds[None] = ("time", np.zeros(12))
+    snapshot = get_inspector(ds).deepcopy()
+    assert get_inspector(snapshot).equals(ds)
+    ds[None][0] = 5
+    assert not get_inspector(snapshot).equals(ds)
