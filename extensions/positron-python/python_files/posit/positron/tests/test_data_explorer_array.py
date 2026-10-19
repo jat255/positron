@@ -374,6 +374,15 @@ def test_array_view_update_changed_schema_is_schema_update(dxf: DataExplorerFixt
     _check_update_variable(dxf.de_service, "da", update_type="schema")
 
 
+def test_array_view_update_renamed_dims_is_schema_update(dxf: DataExplorerFixture):
+    # The title names the dims, so renaming them needs a schema update even when the shape,
+    # dtype, column names, and row labels all match
+    da = make_dataset()["sst"].isel(time=0)
+    dxf.assign_and_open_viewer("da", da)
+    dxf.assign_variable("da", da.rename({"lat": "y", "lon": "x"}))
+    _check_update_variable(dxf.de_service, "da", update_type="schema")
+
+
 #
 # Messages for arrays the Data Explorer cannot show
 #

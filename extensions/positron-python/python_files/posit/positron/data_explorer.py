@@ -3387,7 +3387,8 @@ class ArrayView(DataExplorerTableView):
 
     def get_updated_state(self, new_table) -> StateUpdate:
         # Arrays have no sort keys or filters to carry over. The schema is unchanged when the
-        # shape, dtype, column names, and row labels all match, so only the data needs a refresh.
+        # shape, dtype, column names, row labels, and dims (which the title names) all match, so
+        # only the data needs a refresh.
         new_table = _ArrayTable.from_value(new_table)
         old_table = self.table
         schema_updated = (
@@ -3395,6 +3396,7 @@ class ArrayView(DataExplorerTableView):
             or new_table.dtype != old_table.dtype
             or new_table.columns != old_table.columns
             or new_table.row_labels != old_table.row_labels
+            or new_table.dims != old_table.dims
         )
         return schema_updated, DataExplorerState(self.state.name)
 
