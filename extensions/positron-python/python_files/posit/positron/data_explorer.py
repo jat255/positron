@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import math
 import operator
+import sys
 from datetime import datetime
 from decimal import Decimal
 from types import MappingProxyType
@@ -18,6 +19,7 @@ from typing import (
     Any,
     Callable,
     Tuple,
+    cast,
 )
 
 import comm
@@ -106,11 +108,13 @@ from .data_explorer_comm import (
     TableShape,
     TextSearchType,
 )
+from .inspectors import _dask_nbytes, _dask_variables, _is_dask_array
 from .positron_comm import CommMessage, PositronComm
 from .third_party import is_ibis, is_pandas, is_polars
 from .utils import BackgroundJobQueue, guid
 
 if TYPE_CHECKING:
+    import numpy as np
     import pandas as pd
     import polars as pl
 
@@ -242,7 +246,7 @@ class DataExplorerTableView:
             ]
 
     @property
-    def _has_row_labels(self):
+    def _has_row_labels(self) -> bool:
         return False
 
     @classmethod
@@ -1020,6 +1024,42 @@ def _builtin_isinf(value):
     return math.isinf(value)
 
 
+def _get_value_formatter(
+    options: FormatOptions,
+    math_helper: NumPyMathHelper,
+    is_nat: Callable[[Any], bool],
+    is_na: Callable[[Any], bool],
+) -> Callable[[Any], ColumnValue]:
+    """
+    Return a function that formats one cell value for the frontend.
+
+    Floats use the float formatting options, and missing or non-finite values become the
+    protocol's special value codes. `is_nat` and `is_na` recognize the backend's own
+    not-a-time and missing-value markers.
+    """
+    float_format = _get_float_formatter(options)
+    max_length = options.max_value_length
+
+    def _format_value(x):
+        if math_helper.is_float_scalar(x):
+            if math_helper.isnan(x):
+                return _VALUE_NAN
+            elif math_helper.isinf(x):
+                return _VALUE_INF if x > 0 else _VALUE_NEGINF
+            else:
+                return float_format(x)
+        elif x is None:
+            return _VALUE_NONE
+        elif is_nat(x):
+            return _VALUE_NAT
+        elif is_na(x):
+            return _VALUE_NA
+        else:
+            return _safe_stringify(x, max_length)
+
+    return _format_value
+
+
 def _get_float_formatter(options: FormatOptions) -> Callable:
     sci_format = f".{options.large_num_digits}E"
     medium_format = f".{options.large_num_digits}f"
@@ -1653,26 +1693,12 @@ class PandasView(DataExplorerTableView):
     def _format_values(self, values, options: FormatOptions) -> list[ColumnValue]:
         import pandas as pd
 
-        float_format = _get_float_formatter(options)
-        max_length = options.max_value_length
-
-        def _format_value(x):
-            if self.math_helper.is_float_scalar(x):
-                if self.math_helper.isnan(x):
-                    return _VALUE_NAN
-                elif self.math_helper.isinf(x):
-                    return _VALUE_INF if x > 0 else _VALUE_NEGINF
-                else:
-                    return float_format(x)
-            elif x is None:
-                return _VALUE_NONE
-            elif x is pd.NaT:
-                return _VALUE_NAT
-            elif x is pd.NA:
-                return _VALUE_NA
-            else:
-                return _safe_stringify(x, max_length)
-
+        _format_value = _get_value_formatter(
+            options,
+            self.math_helper,
+            is_nat=lambda x: x is pd.NaT,
+            is_na=lambda x: x is pd.NA,
+        )
         return [_format_value(x) for x in values]
 
     def _export_tabular(self, row_selector, column_selector, fmt: ExportFormat):
@@ -2897,6 +2923,201 @@ class IbisView(PandasView):
     )
 
 
+# ----------------------------------------------------------------------
+# Array Data Explorer RPC implementations for 1-D and 2-D numpy, xarray, and dask arrays
+
+# Opening an array view loads its values into memory, which computes a dask-backed array.
+# Larger dask-backed arrays have no Data Explorer view.
+ARRAY_VIEW_MAX_DASK_BYTES = 100 * 1024 * 1024
+
+
+def _is_viewable_array(value: Any) -> bool:
+    """Whether value is a 1-D or 2-D numpy array, xarray DataArray, or dask array to view."""
+    np_module = sys.modules.get("numpy")
+    xr_module = sys.modules.get("xarray")
+    is_array = (
+        (np_module is not None and isinstance(value, np_module.ndarray))
+        or (xr_module is not None and isinstance(value, xr_module.DataArray))
+        or _is_dask_array(value)
+    )
+    if not is_array or value.ndim not in (1, 2):
+        return False
+    # Read the size from metadata only, so that this check never computes anything.
+    sizes = [_dask_nbytes(array) for _, array in _dask_variables(value)]
+    if None in sizes:
+        # The size of a dim is not known until the array is computed
+        return False
+    return sum(cast("list[int]", sizes)) <= ARRAY_VIEW_MAX_DASK_BYTES
+
+
+class _ArrayTable:
+    """
+    A 1-D or 2-D array in the table shape that DataExplorerTableView reads.
+
+    `values` is always a 2-D numpy array: a 1-D array becomes a single column.
+    """
+
+    def __init__(
+        self,
+        values: np.ndarray,
+        columns: list[str],
+        row_labels: list[str] | None,
+        dims: tuple[str, ...],
+        name: str | None,
+    ):
+        self.values = values
+        self.shape: tuple[int, int] = (values.shape[0], values.shape[1])
+        self.columns = columns
+        self.row_labels = row_labels
+        self.dims = dims
+        self.name = name
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    @classmethod
+    def from_value(cls, value: Any) -> _ArrayTable:
+        if isinstance(value, _ArrayTable):
+            return value
+        if not _is_viewable_array(value):
+            raise TypeError(f"Cannot view value of type {type(value)} as an array table")
+
+        import numpy as np
+
+        xr_module = sys.modules.get("xarray")
+        if xr_module is not None and isinstance(value, xr_module.DataArray):
+            # .values computes a dask-backed DataArray
+            values = np.asarray(value.values)
+            dims = tuple(str(dim) for dim in value.dims)
+            name = None if value.name is None else str(value.name)
+            dim_labels = [cls._dim_labels(value, dim) for dim in value.dims]
+            row_labels = dim_labels[0]
+            columns = ["0" if name is None else name] if value.ndim == 1 else dim_labels[1]
+        else:
+            # np.asarray computes a dask array
+            values = np.asarray(value)
+            dims = ()
+            name = None
+            row_labels = None
+            columns = ["0"] if values.ndim == 1 else [str(i) for i in range(values.shape[1])]
+
+        if values.ndim == 1:
+            values = values.reshape(-1, 1)
+        return cls(values, columns, row_labels, dims, name)
+
+    @staticmethod
+    def _dim_labels(data_array: Any, dim: Any) -> list[str]:
+        # Use the dim's coordinate values when it has one, else index positions
+        if dim in data_array.coords:
+            return [str(label) for label in data_array.coords[dim].to_numpy()]
+        return [str(i) for i in range(data_array.sizes[dim])]
+
+
+_ARRAY_DTYPE_KIND_DISPLAY = MappingProxyType(
+    {
+        "b": ColumnDisplayType.Boolean,
+        "i": ColumnDisplayType.Integer,
+        "u": ColumnDisplayType.Integer,
+        "f": ColumnDisplayType.Floating,
+        "M": ColumnDisplayType.Datetime,
+        "U": ColumnDisplayType.String,
+        "S": ColumnDisplayType.String,
+    }
+)
+
+
+class ArrayView(DataExplorerTableView):
+    """DataExplorer view implementation for 1-D and 2-D numpy, xarray, and dask arrays."""
+
+    table: _ArrayTable
+
+    def __init__(
+        self,
+        table,
+        comm: PositronComm,
+        state: DataExplorerState,
+        job_queue: BackgroundJobQueue,
+        sql_string: str | None = None,
+    ):
+        # For lazy importing NumPy
+        self.math_helper = NumPyMathHelper()
+        super().__init__(_ArrayTable.from_value(table), comm, state, job_queue, sql_string)
+
+    @property
+    def _values(self) -> np.ndarray:
+        return self.table.values  # noqa: PD011
+
+    @property
+    def _has_row_labels(self) -> bool:
+        return self.table.row_labels is not None
+
+    def _get_single_column_schema(self, column_index: int) -> ColumnSchema:
+        return ColumnSchema(
+            column_name=self._get_column_name(column_index),
+            column_index=column_index,
+            type_name=str(self._values.dtype),
+            type_display=self._get_column_type_display(column_index),
+        )
+
+    def _get_column_name(self, column_index: int) -> str:
+        return self.table.columns[column_index]
+
+    def _get_column_type_display(self, column_index: int) -> ColumnDisplayType:  # noqa: ARG002
+        # Every column of an array has the same dtype
+        kind = self._values.dtype.kind
+        return _ARRAY_DTYPE_KIND_DISPLAY.get(kind, ColumnDisplayType.Object)
+
+    def _get_data_values(
+        self,
+        selections: list[ColumnSelection],
+        format_options: FormatOptions,
+    ) -> dict:
+        np = self.math_helper.np
+
+        is_nat: Callable[[Any], bool] = (
+            np.isnat if self._values.dtype.kind in "mM" else (lambda _x: False)
+        )
+        _format_value = _get_value_formatter(
+            format_options, self.math_helper, is_nat=is_nat, is_na=lambda _x: False
+        )
+
+        formatted_columns = []
+        for selection in selections:
+            col = self._values[:, selection.column_index]
+            spec = selection.spec
+            if isinstance(spec, DataSelectionRange):
+                values = col[spec.first_index : spec.last_index + 1]
+            else:
+                values = col.take(spec.indices)
+            formatted_columns.append([_format_value(x) for x in values])
+
+        # Bypass pydantic model for speed
+        return {"columns": formatted_columns}
+
+    def _get_row_labels(self, selection: ArraySelection, _format_options: FormatOptions):
+        labels = self.table.row_labels
+        if labels is None:
+            return {"row_labels": []}
+        if isinstance(selection, DataSelectionRange):
+            selected = labels[selection.first_index : selection.last_index + 1]
+        else:
+            selected = [labels[i] for i in selection.indices]
+        return {"row_labels": [selected]}
+
+    def get_state(self, _unused):
+        state = super().get_state(_unused)
+        if self.table.dims:
+            state.display_name = f"{self.state.name} ({', '.join(self.table.dims)})"
+        return state
+
+    def get_updated_state(self, new_table) -> StateUpdate:  # noqa: ARG002
+        # Any change to an array is treated as a full schema update
+        return True, DataExplorerState(self.state.name)
+
+    # Sorting, filtering, profiles, export, and code conversion are not supported for arrays
+    FEATURES = DataExplorerTableView.FEATURES
+
+
 def _get_table_view(
     table,
     comm: PositronComm,
@@ -2913,6 +3134,8 @@ def _get_table_view(
         return PolarsView(table, comm, state, job_queue)
     elif is_ibis(table):
         return IbisView(table, comm, state, job_queue, sql_string)
+    elif isinstance(table, _ArrayTable) or _is_viewable_array(table):
+        return ArrayView(table, comm, state, job_queue, sql_string)
     else:
         return UnsupportedView(table, comm, state, job_queue)
 
@@ -2922,7 +3145,10 @@ def _value_type_is_supported(value):
         return True
     if is_polars(value):
         return True
-    return bool(is_ibis(value))
+    if is_ibis(value):
+        return True
+    # An _ArrayTable is the table of an open ArrayView, which can open a new explorer for it
+    return isinstance(value, _ArrayTable) or _is_viewable_array(value)
 
 
 class DataExplorerService:

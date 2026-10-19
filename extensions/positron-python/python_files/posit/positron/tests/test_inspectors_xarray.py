@@ -121,9 +121,18 @@ def test_inspect_xarray_dataarray():
     assert ins.get_length() == 3
     assert ins.has_children()
     assert list(ins.get_children()) == ["Coordinates", "Attributes", "Values"]
-    assert not ins.has_viewer()  # piece 2 changes this for 1-D/2-D
+    assert not ins.has_viewer()
     values = get_inspector(ins.get_child("Values"))
     assert "0." in values.get_display_value()[0]
+
+
+def test_xarray_dataarray_viewer():
+    ds = make_dataset()
+    assert get_inspector(ds["sst"].isel(time=0)).has_viewer()  # 2-D
+    assert get_inspector(ds["sst"].isel(time=0, lat=0)).has_viewer()  # 1-D
+    assert get_inspector(ds["lat"]).has_viewer()  # coordinate
+    assert not get_inspector(ds["sst"]).has_viewer()  # 3-D
+    assert not get_inspector(ds).has_viewer()
 
 
 def test_inspect_xarray_dataarray_0d():
@@ -1006,3 +1015,15 @@ def test_dask_backed_0d_arrays_keep_dask_metadata():
     # A DataArray without coordinates keeps the group, which shows "(none)"
     ins = get_inspector(xr.DataArray(da_mod.zeros(())))
     assert list(ins.get_children()) == ["Coordinates", "Attributes", "Dask metadata"]
+
+
+def test_dask_viewer_respects_size_limit():
+    da_mod = pytest.importorskip("dask.array")
+    ds = make_lazy_dataset()
+    # The bomb makes any computation fail the test.
+    assert get_inspector(ds["sst"].isel(time=0)).has_viewer()
+    assert get_inspector(ds["sst"].data[0]).has_viewer()
+    assert not get_inspector(ds["sst"].data).has_viewer()  # 3-D
+    big = da_mod.zeros((6000, 6000))  # 288 MB, never computed
+    assert not get_inspector(big).has_viewer()
+    assert not get_inspector(xr.DataArray(big, dims=("y", "x"))).has_viewer()

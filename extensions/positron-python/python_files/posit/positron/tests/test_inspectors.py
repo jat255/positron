@@ -594,12 +594,30 @@ def test_inspect_numpy_array(value: np.ndarray) -> None:
     verify_inspector(
         value=value,
         display_value=np.array2string(value, separator=","),
-        kind=VariableKind.Collection,
+        kind=VariableKind.Table,
         display_type=f"numpy.int64 {display_shape}",
         type_info="numpy.ndarray",
         has_children=True,
+        has_viewer=True,
         is_truncated=True,
         length=shape[0],
+        mutable=True,
+        mutate=lambda x: x.fill(0),
+    )
+
+
+def test_inspect_numpy_array_3d() -> None:
+    value = np.arange(8, dtype=np.int64).reshape(2, 2, 2)
+    verify_inspector(
+        value=value,
+        display_value=np.array2string(value, separator=","),
+        kind=VariableKind.Collection,
+        display_type="numpy.int64 (2, 2, 2)",
+        type_info="numpy.ndarray",
+        has_children=True,
+        has_viewer=False,
+        is_truncated=True,
+        length=2,
         mutable=True,
         mutate=lambda x: x.fill(0),
     )
