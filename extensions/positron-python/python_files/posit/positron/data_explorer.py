@@ -801,7 +801,7 @@ class DataExplorerTableView:
 
     def _prof_summary_stats(self, column_index: int, options: FormatOptions) -> ColumnSummaryStats:
         col_schema = self._get_single_column_schema(column_index)
-        col = self._get_column(column_index)
+        col = self._get_summary_values(column_index)
 
         ui_type = col_schema.type_display
         handler = self._SUMMARIZERS.get(ui_type, _summarize_not_implemented)
@@ -814,6 +814,10 @@ class DataExplorerTableView:
 
     def _get_column(self, column_index: int):
         raise NotImplementedError
+
+    def _get_summary_values(self, column_index: int):
+        """Return the column values that the summarizers read."""
+        return self._get_column(column_index)
 
     def _prof_freq_table(
         self,
@@ -3239,10 +3243,8 @@ class ArrayView(DataExplorerTableView):
     def _prof_null_count(self, column_index: int) -> int:
         return len(self._values) - len(self._get_valid_values(column_index))
 
-    def _prof_summary_stats(self, column_index: int, options: FormatOptions) -> ColumnSummaryStats:
-        col_schema = self._get_single_column_schema(column_index)
-        handler = self._SUMMARIZERS.get(col_schema.type_display, _summarize_not_implemented)
-        return handler(self._get_valid_values(column_index), options)
+    def _get_summary_values(self, column_index: int) -> np.ndarray:
+        return self._get_valid_values(column_index)
 
     _SUMMARIZERS = MappingProxyType(
         {

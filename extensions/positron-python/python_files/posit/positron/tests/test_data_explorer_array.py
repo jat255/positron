@@ -74,10 +74,10 @@ def test_array_view_dataarray_2d(dxf: DataExplorerFixture):
     assert state["display_name"] == "sst (lat, lon)"
     assert state["has_row_labels"]
     schema = dxf.get_schema("sst")
-    assert [c["column_name"] for c in schema] == [str(v) for v in da.lon.values]
+    assert [c["column_name"] for c in schema] == [str(v) for v in da.lon.to_numpy()]
     assert schema[0]["type_display"] == "floating"
     num_rows = da.sizes["lat"]
-    assert _row_labels(dxf, "sst", num_rows) == [str(v) for v in da.lat.values]
+    assert _row_labels(dxf, "sst", num_rows) == [str(v) for v in da.lat.to_numpy()]
     assert _column_values(dxf, "sst", 1, num_rows) == ["1.00", "6.00", "11.00"]
 
 
@@ -101,7 +101,7 @@ def test_array_view_1d(dxf: DataExplorerFixture):
     state = dxf.get_state("lat")
     assert state["display_name"] == "lat (lat)"
     assert [c["column_name"] for c in dxf.get_schema("lat")] == ["lat"]
-    assert _row_labels(dxf, "lat", 3) == [str(v) for v in lat.values]
+    assert _row_labels(dxf, "lat", 3) == [str(v) for v in lat.to_numpy()]
 
 
 def test_array_view_datetime_1d(dxf: DataExplorerFixture):
@@ -110,7 +110,7 @@ def test_array_view_datetime_1d(dxf: DataExplorerFixture):
     schema = dxf.get_schema("time")
     assert schema[0]["type_display"] == "datetime"
     values = _column_values(dxf, "time", 0, da.sizes["time"])
-    series = pd.Series(da.values)
+    series = pd.Series(da.to_numpy())
     dxf.register_table("series", series)
     expected = _column_values(dxf, "series", 0, len(series))
     assert values == expected
