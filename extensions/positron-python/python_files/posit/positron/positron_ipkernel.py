@@ -34,7 +34,11 @@ from IPython.utils import PyColorize
 
 from .access_keys import encode_access_key
 from .connections import ConnectionsService
-from .data_explorer import DataExplorerService, DataExplorerWarning
+from .data_explorer import (
+    DataExplorerService,
+    DataExplorerWarning,
+    _array_view_unavailable_message,
+)
 from .debugger import PositronDebugger
 from .execute_request import PositronExecuteRequest
 from .formatters.display_formatter import PositronDisplayFormatter
@@ -181,6 +185,9 @@ class PositronMagics(Magics):
         # First try to find the object directly by name
         info = self.shell._ofind(args.object)  # noqa: SLF001
 
+        # The code that evaluates to the object, for error messages
+        expr = args.object
+
         if info.found:
             obj = info.obj
         else:
@@ -190,6 +197,7 @@ class PositronMagics(Magics):
                 obj_name.startswith("'") and obj_name.endswith("'")
             ):
                 obj_name = obj_name[1:-1]  # Remove the quotes
+            expr = obj_name
 
             # If not found as a variable, try to evaluate it as an expression
             try:
@@ -218,7 +226,11 @@ class PositronMagics(Magics):
                     obj, title, variable_path=variable_path, root_accessor=args.object
                 )
         except TypeError as e:
-            raise UsageError(f"cannot view object of type '{get_qualname(obj)}'") from e
+            # Arrays and Datasets that neither explorer shows get a reason and a next step
+            message = _array_view_unavailable_message(obj, expr)
+            if message is None:
+                message = f"cannot view object of type '{get_qualname(obj)}'"
+            raise UsageError(message) from e
 
     @magic_arguments.magic_arguments()
     @magic_arguments.argument(

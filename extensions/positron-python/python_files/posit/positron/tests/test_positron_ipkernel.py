@@ -26,6 +26,8 @@ from .utils import (
     CapturedError,
     assert_register_table_called,
     capture_errors,
+    make_dataset,
+    make_lazy_dataset,
     patch_positron_execute_request,
 )
 
@@ -146,6 +148,40 @@ def test_view_expression_error(
     shell.run_cell('%view "undefined_var + 1"')
     mock_dataexplorer_service.register_table.assert_not_called()
     assert "Failed to evaluate expression" in capsys.readouterr().err
+
+
+def test_view_xarray_dataset_explains(shell: PositronShell, capsys) -> None:
+    shell.user_ns["ds"] = make_dataset()
+    shell.run_cell("%view ds")
+    assert capsys.readouterr().err == (
+        "UsageError: ds is an xarray Dataset; view one of its variables, e.g. %view ds.sst\n"
+    )
+
+
+def test_view_3d_array_explains(shell: PositronShell, capsys) -> None:
+    shell.user_ns["ds"] = make_dataset()
+    shell.run_cell('%view "ds.sst"')
+    assert capsys.readouterr().err == (
+        "UsageError: ds.sst has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. ds.sst.isel(time=0)\n"
+    )
+
+    shell.user_ns["lazy"] = make_lazy_dataset()["sst"].data
+    shell.run_cell("%view lazy")
+    assert capsys.readouterr().err == (
+        "UsageError: lazy has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. lazy[0]\n"
+    )
+
+
+def test_view_array_over_size_limit_explains(shell: PositronShell, capsys) -> None:
+    dask_array = pytest.importorskip("dask.array")
+    shell.user_ns["big"] = dask_array.zeros((6000, 6000))  # never computed
+    shell.run_cell("%view big")
+    assert capsys.readouterr().err == (
+        "UsageError: big is 274.7 MiB (not in memory), over the 100.0 MiB limit for the "
+        "Data Explorer. Select a smaller slice or call .compute() first.\n"
+    )
 
 
 def assert_register_connection_called(mock_connections_service: Mock, obj: Any) -> None:
