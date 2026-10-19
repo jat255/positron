@@ -1597,6 +1597,13 @@ def _xarray_lazy_copy(value: Any) -> Any:
     """Snapshot a dask-backed xarray object for change detection without computing it."""
     out = value.copy(deep=False)
     out.attrs = dict(value.attrs)
+    # A shallow copy shares each dask Array object with the original. Dask's in-place assignment
+    # gives the array it is called on a new name, so a shared object would pass the new name on
+    # to the snapshot too. A shallow copy of each dask Array is a new object with the same name
+    # and graph, and computes nothing.
+    for variable in _xarray_variables(out).values():
+        if variable.chunks is not None and _is_dask_array(variable.data):
+            variable.data = copy.copy(variable.data)
     return out
 
 

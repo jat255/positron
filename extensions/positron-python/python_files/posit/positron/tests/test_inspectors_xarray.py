@@ -408,3 +408,18 @@ def test_dask_comparison_cost_counts_eager_coordinates_only():
     coord_bytes = sum(ds[name].nbytes for name in ("time", "lat", "lon"))
     assert get_inspector(ds).get_comparison_cost() == coord_bytes
     assert get_inspector(ds["sst"]).get_comparison_cost() == coord_bytes
+
+
+def test_dask_equals_detects_in_place_edit_of_original():
+    # The snapshot must not share dask Array objects with the original: dask's __setitem__
+    # gives the array it is called on a new name, which a shared object would pass on to the
+    # snapshot too.
+    ds = make_lazy_dataset()
+    snapshot = get_inspector(ds).deepcopy()
+    ds["sst"][0, 0, 0] = 1
+    assert not get_inspector(snapshot).equals(ds)
+
+    da = make_lazy_dataset()["sst"]
+    snapshot = get_inspector(da).deepcopy()
+    da[0, 0, 0] = 1
+    assert not get_inspector(snapshot).equals(da)
