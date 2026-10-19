@@ -5,7 +5,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import copy
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
@@ -14,12 +15,14 @@ import pytest
 from positron.inspectors import (
     ArrayGroup,
     ArrayGroupInspector,
+    DaskArrayInspector,
     MetadataRow,
     MetadataRowInspector,
     XarrayDataArrayInspector,
     XarrayDatasetInspector,
     _format_name_list,
     _format_nbytes,
+    _is_dask_backed,
     get_inspector,
 )
 
@@ -27,6 +30,8 @@ if TYPE_CHECKING:
     import xarray as xr
 else:
     xr = pytest.importorskip("xarray")
+
+BackendArray = pytest.importorskip("xarray.backends").BackendArray
 
 
 def make_dataset(time: int = 4, lat: int = 3, lon: int = 5) -> xr.Dataset:
@@ -141,7 +146,7 @@ def test_inspect_xarray_dataarray_0d():
     assert ins.get_display_value()[0] == "[scalar] xarray.DataArray"
     assert ins.get_length() == 0
     assert not ins.has_viewer()
-    assert ins.get_display_type() == "DataArray [] float32"
+    assert ins.get_display_type() == "DataArray [scalar] float32"
 
 
 def test_inspect_xarray_dataarray_0d_no_children():
@@ -192,3 +197,214 @@ def test_format_name_list():
     text, truncated = _format_name_list(names)
     assert truncated
     assert len(text) < len(", ".join(names))
+
+
+class _CountingBackendArray(BackendArray):
+    """A lazily indexed backend array that counts how many elements are read."""
+
+    def __init__(self, array: np.ndarray) -> None:
+        self.array = array
+        self.shape = array.shape
+        self.dtype = array.dtype
+        self.elements_read = 0
+
+    def __getitem__(self, key: Any) -> np.ndarray:
+        from xarray.core import indexing
+
+        return indexing.explicit_indexing_adapter(
+            key, self.shape, indexing.IndexingSupport.BASIC, self._raw_getitem
+        )
+
+    def _raw_getitem(self, key: tuple) -> np.ndarray:
+        result = self.array[key]
+        self.elements_read += result.size
+        return result
+
+
+def make_lazily_indexed_dataarray(shape: tuple[int, ...]) -> tuple[xr.DataArray, Any]:
+    from xarray.core import indexing
+
+    backend = _CountingBackendArray(np.arange(np.prod(shape), dtype="float64").reshape(shape))
+    dims = tuple(f"d{i}" for i in range(len(shape)))
+    variable = xr.Variable(dims, indexing.LazilyIndexedArray(backend))
+    return xr.DataArray(variable), backend
+
+
+def test_values_preview_reads_only_edge_items():
+    shape = (200, 300, 400)
+    da, backend = make_lazily_indexed_dataarray(shape)
+    preview = get_inspector(get_inspector(da).get_child("Values")).get_display_value()[0]
+    # At most 7 items per dim are read: 3 shown at each edge, plus one hidden by the ellipsis.
+    assert 0 < backend.elements_read <= 7**3
+    # The preview matches numpy's own summary of the full array.
+    expected = np.array2string(backend.array, threshold=100, edgeitems=3)
+    assert preview == " ".join(expected.split())
+
+
+def test_values_preview_small_array_unchanged():
+    da = xr.DataArray(np.arange(10.0), dims=("x",))
+    preview = get_inspector(get_inspector(da).get_child("Values")).get_display_value()[0]
+    assert preview == "[0. 1. 2. 3. 4. 5. 6. 7. 8. 9.]"
+
+
+def test_values_preview_mixed_dim_lengths():
+    shape = (2, 50, 4)
+    da, backend = make_lazily_indexed_dataarray(shape)
+    preview = get_inspector(get_inspector(da).get_child("Values")).get_display_value()[0]
+    assert backend.elements_read <= 2 * 7 * 4
+    expected = np.array2string(backend.array, threshold=100, edgeitems=3)
+    assert preview == " ".join(expected.split())
+
+
+#
+# Dask-backed objects
+#
+
+
+def _boom(_block):
+    raise AssertionError("dask computation was triggered")
+
+
+def make_lazy_dataset() -> xr.Dataset:
+    da_mod = pytest.importorskip("dask.array")
+    ds = make_dataset(time=12, lat=3, lon=5)
+    out = ds.copy()
+    for name in ("sst", "anom"):
+        lazy = da_mod.from_array(ds[name].values, chunks=(6, 3, 5))
+        bomb = lazy.map_blocks(_boom, dtype="float32", meta=np.empty((0, 0, 0), "float32"))
+        out[name] = (ds[name].dims, bomb, ds[name].attrs)
+    return out
+
+
+def test_is_dask_backed():
+    ds = make_lazy_dataset()
+    assert _is_dask_backed(ds)
+    assert _is_dask_backed(ds["sst"])
+    assert _is_dask_backed(ds["sst"].data)
+    assert not _is_dask_backed(make_dataset())
+    assert not _is_dask_backed(make_dataset()["sst"])
+    assert not _is_dask_backed(np.ones(3))
+    assert not _is_dask_backed(ds["time"])
+
+
+def test_inspect_dask_backed_dataset():
+    ins = get_inspector(make_lazy_dataset())
+    assert ins.get_display_value() == ("[3 dims x 2 vars] xarray.Dataset (dask)", True)
+    assert list(ins.get_children())[-1] == "Dask metadata"
+    group = get_inspector(ins.get_child("Dask metadata"))
+    assert group.get_display_value()[0] == "2 chunks, 1.4 KiB (lazy)"  # 12*3*5*4*2 bytes
+    rows = {
+        k: get_inspector(group.get_child(k)).get_display_value()[0] for k in group.get_children()
+    }
+    assert list(rows) == ["chunks", "nbytes", "graph layers"]
+    assert rows["chunks"] == "time: 6, lat: 3, lon: 5"
+    assert rows["nbytes"] == "1.4 KiB"
+    assert rows["graph layers"] == "4"  # from_array and map_blocks for each variable
+
+
+def _walk(value: Any, depth: int = 0) -> int:
+    """Call every inspector method used by the Variables pane on value and its descendants."""
+    ins = get_inspector(value)
+    ins.get_display_value()
+    ins.get_display_type()
+    ins.get_kind()
+    ins.get_size()
+    ins.get_length()
+    ins.has_viewer()
+    ins.get_comparison_cost()
+    try:
+        snapshot = ins.deepcopy()
+    except copy.Error:
+        pass
+    else:
+        assert ins.equals(snapshot)
+    visited = 1
+    if ins.has_children() and depth < 6:
+        for key in ins.get_children():
+            assert ins.has_child(key)
+            visited += _walk(ins.get_child(key), depth + 1)
+    return visited
+
+
+def test_dask_backed_inspection_never_computes():
+    ds = make_lazy_dataset()
+    # The bomb makes any computation fail the test.
+    assert _walk(ds) > 20
+    assert _walk(ds["sst"]) > 5
+    assert _walk(ds["sst"].data) > 3
+
+
+def test_inspect_dask_dataarray():
+    ins = get_inspector(make_lazy_dataset()["sst"])
+    assert ins.get_display_value() == ("[time: 12 x lat: 3 x lon: 5] xarray.DataArray (dask)", True)
+    assert list(ins.get_children()) == ["Coordinates", "Attributes", "Dask metadata"]
+    group = get_inspector(ins.get_child("Dask metadata"))
+    assert group.get_display_value()[0] == "2 chunks, 720 B (lazy)"
+    chunks = get_inspector(group.get_child("chunks")).get_display_value()[0]
+    assert chunks == "time: 6, lat: 3, lon: 5"
+
+
+def test_inspect_bare_dask_array():
+    arr = make_lazy_dataset()["sst"].data
+    ins = get_inspector(arr)
+    assert type(ins) is DaskArrayInspector
+    assert ins.get_kind() == "table"
+    assert ins.get_display_type() == "Array [12x3x5] float32"
+    assert ins.get_length() == 12
+    assert ins.get_size() == 720
+    assert list(ins.get_children()) == ["Dask metadata"]
+    group = get_inspector(ins.get_child("Dask metadata"))
+    assert group.get_display_value()[0] == "2 chunks, 720 B (lazy)"
+    chunks = get_inspector(group.get_child("chunks")).get_display_value()[0]
+    assert chunks == "(6, 3, 5)"
+    layers = get_inspector(group.get_child("graph layers")).get_display_value()[0]
+    assert layers == "2"
+
+
+def test_dask_mixed_chunks():
+    ds = make_lazy_dataset()
+    ds["anom"] = ds["anom"].chunk({"time": 4})
+    group = get_inspector(get_inspector(ds).get_child("Dask metadata"))
+    assert group.get_display_value()[0] == "mixed chunks, 1.4 KiB (lazy)"
+    chunks = get_inspector(group.get_child("chunks")).get_display_value()[0]
+    assert chunks == "mixed (varies by variable)"
+
+
+def test_dask_equals_detects_attr_change():
+    ds = make_lazy_dataset()
+    ins = get_inspector(ds)
+    snapshot = ins.deepcopy()
+    assert ins.equals(snapshot)
+    snapshot.attrs["title"] = "x"
+    assert not ins.equals(snapshot)
+    snapshot = ins.deepcopy()
+    snapshot["sst"].attrs["units"] = "K"
+    assert not ins.equals(snapshot)
+    snapshot = ins.deepcopy()
+    snapshot["sst"] = snapshot["sst"] + 1
+    assert not ins.equals(snapshot)
+    # Eager in both directions: comparing never computes the dask side.
+    assert not ins.equals(make_dataset(time=12))
+    assert not get_inspector(make_dataset(time=12)).equals(ds)
+
+    da = ds["sst"]
+    ins = get_inspector(da)
+    snapshot = ins.deepcopy()
+    assert ins.equals(snapshot)
+    snapshot.attrs["title"] = "x"
+    assert not ins.equals(snapshot)
+    assert not get_inspector(make_dataset(time=12)["sst"]).equals(da)
+
+    arr = da.data
+    ins = get_inspector(arr)
+    snapshot = ins.deepcopy()
+    assert ins.equals(snapshot)
+    snapshot[0, 0, 0] = 1
+    assert not ins.equals(snapshot)
+
+
+def test_dask_comparison_cost_counts_eager_coordinates_only():
+    ds = make_lazy_dataset()
+    coord_bytes = sum(ds[name].nbytes for name in ("time", "lat", "lon"))
+    assert get_inspector(ds).get_comparison_cost() == coord_bytes
+    assert get_inspector(ds["sst"]).get_comparison_cost() == coord_bytes
