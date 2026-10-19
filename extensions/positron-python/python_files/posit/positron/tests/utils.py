@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generator
 from unittest.mock import Mock, patch
 
+import pytest
+
 if TYPE_CHECKING:
+    import xarray as xr
+
     from positron._vendor.pydantic import BaseModel
     from positron.utils import JsonData, JsonRecord
 
@@ -202,3 +206,56 @@ def capture_errors() -> Generator[list[CapturedError], None, None]:
         yield errors
     finally:
         session.send = original_send
+
+
+#
+# xarray and dask fixtures. Each helper skips the calling test when a library it needs is not
+# installed, so importing this module never requires xarray or dask.
+#
+
+
+def make_dataset(time: int = 4, lat: int = 3, lon: int = 5) -> xr.Dataset:
+    """A small eager Dataset shaped like NOAA OISST: `sst` and `anom` over (time, lat, lon)."""
+    np = pytest.importorskip("numpy")
+    pd = pytest.importorskip("pandas")
+    xr = pytest.importorskip("xarray")
+    shape = (time, lat, lon)
+    size = time * lat * lon
+    coords = {
+        "time": pd.date_range("2020-01-01", periods=time, freq="D"),
+        "lat": np.linspace(-10, 10, lat),
+        "lon": np.linspace(0, 40, lon),
+    }
+    dims = ("time", "lat", "lon")
+    return xr.Dataset(
+        {
+            "sst": (dims, np.arange(size, dtype="float32").reshape(shape)),
+            "anom": (dims, np.ones(shape, dtype="float32")),
+        },
+        coords=coords,
+        attrs={"Conventions": "CF-1.5", "title": "NOAA OISST v2.1", "source": "synthetic"},
+    )
+
+
+def fail_on_compute(_block: Any) -> Any:
+    """A dask block function that fails the test if dask ever computes it."""
+    raise AssertionError("dask computation was triggered")
+
+
+def make_compute_bomb(values: Any, chunks: Any) -> Any:
+    """A dask array with the shape, dtype, and chunks of values that fails if computed."""
+    np = pytest.importorskip("numpy")
+    da_mod = pytest.importorskip("dask.array")
+    lazy = da_mod.from_array(values, chunks=chunks)
+    meta = np.empty((0,) * values.ndim, values.dtype)
+    return lazy.map_blocks(fail_on_compute, dtype=values.dtype, meta=meta)
+
+
+def make_lazy_dataset() -> xr.Dataset:
+    """`make_dataset(time=12)` with `sst` and `anom` replaced by dask arrays that fail if computed."""
+    ds = make_dataset(time=12, lat=3, lon=5)
+    out = ds.copy()
+    for name in ("sst", "anom"):
+        bomb = make_compute_bomb(ds[name].to_numpy(), chunks=(6, 3, 5))
+        out[name] = (ds[name].dims, bomb, ds[name].attrs)
+    return out

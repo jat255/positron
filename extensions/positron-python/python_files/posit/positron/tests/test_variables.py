@@ -1004,8 +1004,7 @@ async def test_shutdown(variables_service: VariablesService, variables_comm: Dum
 def test_inspect_xarray_dataset_group_paths(
     shell: PositronShell, variables_comm: DummyComm
 ) -> None:
-    pytest.importorskip("xarray")
-    from .test_inspectors_xarray import make_dataset
+    from .utils import make_dataset
 
     shell.user_ns["ds"] = make_dataset()
 

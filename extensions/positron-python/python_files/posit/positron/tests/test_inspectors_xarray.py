@@ -26,31 +26,14 @@ from positron.inspectors import (
     get_inspector,
 )
 
+from .utils import make_dataset, make_lazy_dataset
+
 if TYPE_CHECKING:
     import xarray as xr
 else:
     xr = pytest.importorskip("xarray")
 
 BackendArray = pytest.importorskip("xarray.backends").BackendArray
-
-
-def make_dataset(time: int = 4, lat: int = 3, lon: int = 5) -> xr.Dataset:
-    shape = (time, lat, lon)
-    size = time * lat * lon
-    coords = {
-        "time": pd.date_range("2020-01-01", periods=time, freq="D"),
-        "lat": np.linspace(-10, 10, lat),
-        "lon": np.linspace(0, 40, lon),
-    }
-    dims = ("time", "lat", "lon")
-    return xr.Dataset(
-        {
-            "sst": (dims, np.arange(size, dtype="float32").reshape(shape)),
-            "anom": (dims, np.ones(shape, dtype="float32")),
-        },
-        coords=coords,
-        attrs={"Conventions": "CF-1.5", "title": "NOAA OISST v2.1", "source": "synthetic"},
-    )
 
 
 def test_inspect_xarray_dataset():
@@ -259,21 +242,6 @@ def test_values_preview_mixed_dim_lengths():
 #
 # Dask-backed objects
 #
-
-
-def _boom(_block):
-    raise AssertionError("dask computation was triggered")
-
-
-def make_lazy_dataset() -> xr.Dataset:
-    da_mod = pytest.importorskip("dask.array")
-    ds = make_dataset(time=12, lat=3, lon=5)
-    out = ds.copy()
-    for name in ("sst", "anom"):
-        lazy = da_mod.from_array(ds[name].values, chunks=(6, 3, 5))
-        bomb = lazy.map_blocks(_boom, dtype="float32", meta=np.empty((0, 0, 0), "float32"))
-        out[name] = (ds[name].dims, bomb, ds[name].attrs)
-    return out
 
 
 def test_is_dask_backed():
