@@ -24,6 +24,7 @@ from ..data_explorer import (
     DataExplorerService,
     _array_view_unavailable_message,
     _ArrayTable,
+    _count_objects,
     _value_type_is_supported,
 )
 from ..data_explorer_comm import SupportStatus
@@ -467,6 +468,29 @@ def test_array_view_object_unorderable_values(dxf: DataExplorerFixture):
     assert table["small_frequency_table"]["counts"] == [2, 1]
     assert table["small_frequency_table"]["other_count"] == 2
     assert _summary(dxf, "arr", 0)["other_stats"]["num_unique"] == 4
+
+
+def test_count_objects_unhashable_by_equality():
+    # Equal dicts with different insertion order are one value
+    assert _count_objects([{"a": 1, "b": 2}, {"b": 2, "a": 1}]) == ([{"a": 1, "b": 2}], [2])
+    assert _count_objects([[1, 2], [1, 2], [2, 1]]) == ([[1, 2], [2, 1]], [2, 1])
+    # A comparison that does not return a bool, or that raises, counts as not equal
+    first, second = np.array([1, 2]), np.array([1, 2])
+    assert _count_objects([first, second])[1] == [1, 1]  # == returns an array
+    uniques, counts = _count_objects([[first], [second]])
+    assert counts == [1, 1]
+    assert uniques[0][0] is first
+    assert uniques[1][0] is second
+
+
+def test_array_view_object_unhashable_equal_values(dxf: DataExplorerFixture):
+    arr = np.empty(2, dtype=object)
+    arr[0] = {"a": 1, "b": 2}
+    arr[1] = {"b": 2, "a": 1}
+    dxf.register_table("arr", arr)
+    table = dxf.get_column_profiles("arr", [_get_frequency_table(0, 2)])[0]
+    assert table["small_frequency_table"]["counts"] == [2]
+    assert _summary(dxf, "arr", 0)["other_stats"]["num_unique"] == 1
 
 
 #

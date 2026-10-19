@@ -3188,22 +3188,42 @@ def _count_objects(values: Iterable[Any]) -> tuple[list[Any], list[int]]:
     """
     Count the distinct values of an object column by value equality, in order of first appearance.
 
-    Values do not need to be orderable. Unhashable values are grouped by their repr.
+    Values do not need to be orderable. Each unhashable value is compared with `==` to the
+    unhashable values seen before it; a comparison that raises or does not return a bool counts as
+    not equal.
     """
-    counts: dict[Any, int] = {}
-    firsts: dict[Any, Any] = {}
+    # Each distinct value, with its count, in order of first appearance
+    uniques: list[Any] = []
+    counts: list[int] = []
+    # Index into uniques of each hashable value
+    hashable_index: dict[Any, int] = {}
+    # Indices into uniques of the unhashable values
+    unhashable_indices: list[int] = []
     for value in values:
         try:
-            key = (True, value)
-            hash(key)
+            index = hashable_index.get(value)
         except TypeError:
-            key = (False, type(value), repr(value))
-        if key in counts:
-            counts[key] += 1
+            index = next((i for i in unhashable_indices if _objects_equal(uniques[i], value)), None)
+            if index is None:
+                unhashable_indices.append(len(uniques))
         else:
-            counts[key] = 1
-            firsts[key] = value
-    return list(firsts.values()), list(counts.values())
+            if index is None:
+                hashable_index[value] = len(uniques)
+        if index is None:
+            uniques.append(value)
+            counts.append(1)
+        else:
+            counts[index] += 1
+    return uniques, counts
+
+
+def _objects_equal(a: Any, b: Any) -> bool:
+    """Whether a == b is True, treating a comparison that raises or is not a bool as unequal."""
+    try:
+        result = a == b
+    except Exception:
+        return False
+    return result is True
 
 
 def _array_summarize_object(values: np.ndarray, _options: FormatOptions):
