@@ -154,7 +154,7 @@ def test_view_xarray_dataset_explains(shell: PositronShell, capsys) -> None:
     shell.user_ns["ds"] = make_dataset()
     shell.run_cell("%view ds")
     assert capsys.readouterr().err == (
-        "UsageError: ds is an xarray Dataset; view one of its variables, e.g. %view ds.sst\n"
+        "UsageError: ds is an xarray Dataset; view one of its variables, e.g. %view ds['sst']\n"
     )
 
 
@@ -172,6 +172,34 @@ def test_view_3d_array_explains(shell: PositronShell, capsys) -> None:
         "UsageError: lazy has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
         "Select a slice first, e.g. lazy[0]\n"
     )
+
+
+def test_view_expression_explains_with_parentheses(shell: PositronShell, capsys) -> None:
+    ds = make_dataset()
+    shell.user_ns["left"] = ds["sst"]
+    shell.user_ns["right"] = ds["sst"]
+    shell.run_cell('%view "left + right"')
+    assert capsys.readouterr().err == (
+        "UsageError: left + right has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. (left + right).isel(time=0)\n"
+    )
+
+
+def test_view_dataset_expression_suggests_a_valid_command(shell: PositronShell, capsys) -> None:
+    np = pytest.importorskip("numpy")
+    xr = pytest.importorskip("xarray")
+    ds = xr.Dataset({"my var": (("a", "b"), np.zeros((2, 2)))})
+    shell.user_ns["left"] = ds
+    shell.user_ns["right"] = ds
+    shell.run_cell('%view "left + right"')
+    err = capsys.readouterr().err
+    command = "%view \"(left + right)['my var']\""
+    assert err == (
+        f"UsageError: left + right is an xarray Dataset; view one of its variables, e.g. {command}\n"
+    )
+    # The suggested command opens the variable
+    shell.run_cell(command)
+    assert capsys.readouterr().err == ""
 
 
 def test_view_array_over_size_limit_explains(shell: PositronShell, capsys) -> None:

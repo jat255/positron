@@ -381,7 +381,7 @@ def test_array_view_update_changed_schema_is_schema_update(dxf: DataExplorerFixt
 def test_array_view_unavailable_message():
     ds = make_dataset()
     assert _array_view_unavailable_message(ds, "ds") == (
-        "ds is an xarray Dataset; view one of its variables, e.g. %view ds.sst"
+        "ds is an xarray Dataset; view one of its variables, e.g. %view ds['sst']"
     )
     assert _array_view_unavailable_message(ds["sst"], "ds.sst") == (
         "ds.sst has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
@@ -409,6 +409,48 @@ def test_array_view_unavailable_message():
     assert _array_view_unavailable_message(big, "big") == (
         "big is 274.7 MiB (not in memory), over the 100.0 MiB limit for the Data Explorer. "
         "Select a smaller slice or call .compute() first."
+    )
+
+
+def test_array_view_unavailable_message_unsafe_names():
+    xr = pytest.importorskip("xarray")
+    # A variable named like a Dataset method gets bracket indexing, which cannot resolve to the
+    # method
+    ds = xr.Dataset({"isel": (("a", "b"), np.zeros((2, 2)))})
+    assert _array_view_unavailable_message(ds, "ds") == (
+        "ds is an xarray Dataset; view one of its variables, e.g. %view ds['isel']"
+    )
+    # A variable name with a space needs the %view argument quoted
+    ds = xr.Dataset({"my var": (("a", "b"), np.zeros((2, 2)))})
+    assert _array_view_unavailable_message(ds, "ds") == (
+        "ds is an xarray Dataset; view one of its variables, e.g. %view \"ds['my var']\""
+    )
+    # A dim named with a keyword cannot be a keyword argument
+    da = xr.DataArray(np.zeros((2, 2, 2)), dims=("class", "y", "x"))
+    assert _array_view_unavailable_message(da, "da") == (
+        "da has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. da.isel({'class': 0})"
+    )
+
+
+def test_array_view_unavailable_message_parenthesizes_expressions():
+    xr = pytest.importorskip("xarray")
+    da = xr.DataArray(np.zeros((2, 2, 2)), dims=("time", "y", "x"))
+    assert _array_view_unavailable_message(da, "left + right") == (
+        "left + right has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. (left + right).isel(time=0)"
+    )
+    assert _array_view_unavailable_message(np.zeros((2, 2, 2)), "-arr") == (
+        "-arr has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. (-arr)[0]"
+    )
+    # Name, attribute, subscript, and call chains bind tighter than the suggested suffix
+    for expr in ("ds.sst", "ds['sst']", "ds.sel(lat=0)", "f(x)[0].y"):
+        assert f"e.g. {expr}.isel(time=0)" in cast("str", _array_view_unavailable_message(da, expr))
+
+    ds = xr.Dataset({"sst": (("a", "b"), np.zeros((2, 2)))})
+    assert _array_view_unavailable_message(ds, "a+b") == (
+        "a+b is an xarray Dataset; view one of its variables, e.g. %view \"(a+b)['sst']\""
     )
 
 

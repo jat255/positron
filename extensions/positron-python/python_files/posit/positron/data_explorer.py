@@ -7,6 +7,8 @@
 # pyright: reportOptionalMemberAccess=false
 from __future__ import annotations
 
+import ast
+import keyword
 import logging
 import math
 import operator
@@ -2992,21 +2994,21 @@ def _array_view_unavailable_message(value: Any, expr: str) -> str | None:
         names = list(value.data_vars)
         if not names:
             return f"{expr} is an xarray Dataset with no data variables to view"
-        return (
-            f"{expr} is an xarray Dataset; view one of its variables, "
-            f"e.g. %view {_child_expr(expr, names[0])}"
-        )
+        child = _child_expr(_operand_expr(expr), names[0])
+        example = _view_command(child, quote=not _is_postfix_chain(expr)) or child
+        return f"{expr} is an xarray Dataset; view one of its variables, e.g. {example}"
     if not _is_array(value):
         return None
     if value.ndim > 2:
+        operand = _operand_expr(expr)
         if xr_module is not None and isinstance(value, xr_module.DataArray):
             dim = value.dims[0]
-            if isinstance(dim, str) and dim.isidentifier():
-                example = f"{expr}.isel({dim}=0)"
+            if isinstance(dim, str) and dim.isidentifier() and not keyword.iskeyword(dim):
+                example = f"{operand}.isel({dim}=0)"
             else:
-                example = f"{expr}.isel({{{dim!r}: 0}})"
+                example = f"{operand}.isel({{{dim!r}: 0}})"
         else:
-            example = f"{expr}[0]"
+            example = f"{operand}[0]"
         return (
             f"{expr} has {value.ndim} dimensions; the Data Explorer shows 1-D and 2-D arrays. "
             f"Select a slice first, e.g. {example}"
@@ -3027,10 +3029,56 @@ def _array_view_unavailable_message(value: Any, expr: str) -> str | None:
 
 
 def _child_expr(expr: str, name: Any) -> str:
-    """An expression for the variable `name` of the Dataset that expr evaluates to."""
-    if isinstance(name, str) and name.isidentifier():
-        return f"{expr}.{name}"
+    """
+    An expression for the variable `name` of the Dataset that expr evaluates to.
+
+    Uses indexing, since attribute access resolves to a Dataset method or property of the same
+    name (e.g. a variable named "isel"). repr quotes a string with single quotes, so the result
+    can go inside a double-quoted %view argument.
+    """
     return f"{expr}[{name!r}]"
+
+
+def _is_postfix_chain(expr: str) -> bool:
+    """
+    Whether expr is a name followed by any attribute accesses, subscripts, and calls.
+
+    Such an expression binds tighter than any suffix appended to it, e.g. `.isel(time=0)`.
+    """
+    try:
+        node = ast.parse(expr.strip(), mode="eval").body
+    except SyntaxError:
+        return False
+    while True:
+        if isinstance(node, ast.Name):
+            return True
+        if isinstance(node, (ast.Attribute, ast.Subscript)):
+            node = node.value
+        elif isinstance(node, ast.Call):
+            node = node.func
+        else:
+            return False
+
+
+def _operand_expr(expr: str) -> str:
+    """expr, parenthesized unless a suffix appended to it applies to the whole expression."""
+    return expr if _is_postfix_chain(expr) else f"({expr})"
+
+
+def _view_command(expr: str, *, quote: bool) -> str | None:
+    """
+    A %view command for expr, or None when no quoting keeps expr as one argument.
+
+    %view splits its arguments on whitespace and strips one pair of quotes around each, so expr
+    is quoted when asked or when it has whitespace or starts with a quote. Double quotes come
+    first, because Windows command-line splitting treats only double quotes as quotes.
+    """
+    if not quote and not any(c.isspace() for c in expr) and expr[:1] not in "\"'":
+        return f"%view {expr}"
+    for mark in ('"', "'"):
+        if mark not in expr:
+            return f"%view {mark}{expr}{mark}"
+    return None
 
 
 class _ArrayTable:
