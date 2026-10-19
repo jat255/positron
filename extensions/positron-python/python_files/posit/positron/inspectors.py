@@ -741,9 +741,10 @@ class NumpyNdarrayInspector(_BaseArrayInspector["np.ndarray"]):
     CLASS_QNAME = "numpy.ndarray"
 
     def get_kind(self) -> str:
-        # 1-D and 2-D arrays open in the Data Explorer, and the frontend labels the viewer of a
-        # "table" as "View Data Table"
-        if self.value.ndim in (1, 2):
+        # Arrays that open in the Data Explorer are tables, and the frontend labels the viewer of a
+        # "table" as "View Data Table". Others, such as structured arrays, stay collections so
+        # that %view opens them in the Object Explorer.
+        if self.value.ndim in (1, 2) and self.has_viewer():
             return "table"
         return super().get_kind()
 

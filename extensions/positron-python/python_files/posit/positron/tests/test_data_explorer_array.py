@@ -29,6 +29,7 @@ from ..data_explorer import (
 )
 from ..data_explorer_comm import SupportStatus
 from ..inspectors import get_inspector
+from ..object_explorer import is_explorable
 from ..utils import guid
 from . import test_data_explorer
 from .test_data_explorer import (
@@ -463,6 +464,19 @@ def test_structured_array_is_not_viewable():
     arr = np.zeros(3, dtype=[("a", "i4"), ("b", "f8")])
     assert not _value_type_is_supported(arr)
     assert not get_inspector(arr).has_viewer()
+
+
+def test_structured_array_falls_back_to_object_explorer():
+    # A structured array has no Data Explorer view, so it keeps kind "collection" and %view opens
+    # it in the Object Explorer
+    for arr in (
+        np.zeros(3, dtype=[("a", "i4"), ("b", "f8")]),
+        np.zeros((2, 3), dtype=[("a", "i4"), ("b", "f8")]),
+    ):
+        inspector = get_inspector(arr)
+        assert inspector.get_kind() == "collection"
+        assert not inspector.has_viewer()
+        assert is_explorable(arr)
 
 
 def test_array_view_datetime_labels(dxf: DataExplorerFixture):
