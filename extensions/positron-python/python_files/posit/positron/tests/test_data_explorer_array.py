@@ -460,7 +460,47 @@ def test_array_view_unavailable_message_parenthesizes_expressions():
 
     ds = xr.Dataset({"sst": (("a", "b"), np.zeros((2, 2)))})
     assert _array_view_unavailable_message(ds, "a+b") == (
-        "a+b is an xarray Dataset; view one of its variables, e.g. %view \"(a+b)['sst']\""
+        "a+b is an xarray Dataset; view one of its variables, e.g. %view \"(a + b)['sst']\""
+    )
+
+
+def test_array_view_unavailable_message_ignores_comments():
+    # Suggestions are built from the parsed expression, so a trailing comment cannot swallow
+    # the appended slice or variable
+    xr = pytest.importorskip("xarray")
+    da = xr.DataArray(np.zeros((2, 2, 2)), dims=("time", "y", "x"))
+    assert _array_view_unavailable_message(da, "arr # note") == (
+        "arr # note has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. arr.isel(time=0)"
+    )
+    assert "e.g. (left + right).isel(time=0)" in cast(
+        "str", _array_view_unavailable_message(da, "left + right  # sum")
+    )
+    ds = xr.Dataset({"sst": (("a", "b"), np.zeros((2, 2)))})
+    assert _array_view_unavailable_message(ds, "ds # note") == (
+        "ds # note is an xarray Dataset; view one of its variables, e.g. %view ds['sst']"
+    )
+
+
+def test_array_view_unavailable_message_without_a_valid_command():
+    # %view cannot take an argument with a double quote on Windows, where only double quotes
+    # quote arguments, so these names get plain guidance instead of a command
+    xr = pytest.importorskip("xarray")
+    # IPython replaces {x} in a magic's arguments with the value of x
+    for name in ("a' \"b", "it's", "{x}"):
+        ds = xr.Dataset({name: (("a", "b"), np.zeros((2, 2)))})
+        assert _array_view_unavailable_message(ds, "ds") == (
+            f"ds is an xarray Dataset; view one of its data variables: {name}"
+        )
+    # A numpy string name has a literal form
+    ds = xr.Dataset({np.str_("sst"): (("a", "b"), np.zeros((2, 2)))})
+    assert _array_view_unavailable_message(ds, "ds") == (
+        "ds is an xarray Dataset; view one of its variables, e.g. %view ds['sst']"
+    )
+    # A name with no literal form
+    ds = xr.Dataset({float("nan"): (("a", "b"), np.zeros((2, 2)))})
+    assert _array_view_unavailable_message(ds, "ds") == (
+        "ds is an xarray Dataset; view one of its data variables: nan"
     )
 
 

@@ -111,7 +111,13 @@ from .data_explorer_comm import (
     TableShape,
     TextSearchType,
 )
-from .inspectors import _dask_nbytes, _dask_variables, _format_nbytes, _is_dask_array
+from .inspectors import (
+    _dask_nbytes,
+    _dask_variables,
+    _format_name_list,
+    _format_nbytes,
+    _is_dask_array,
+)
 from .positron_comm import CommMessage, PositronComm
 from .third_party import is_ibis, is_pandas, is_polars
 from .utils import BackgroundJobQueue, guid
@@ -2988,30 +2994,34 @@ def _array_view_unavailable_message(value: Any, expr: str) -> str | None:
     Explain why the Data Explorer cannot show value, which expr evaluates to.
 
     Returns None when value is not an array or Dataset, or when the Data Explorer can show it.
+    The message names expr as typed. Each suggestion is built from the parsed expr, so it is
+    valid code whatever expr's spacing, comments, or operators; when no valid suggestion exists,
+    the message gives plain guidance instead.
     """
+    node = _parse_expr(expr)
     xr_module = sys.modules.get("xarray")
     if xr_module is not None and isinstance(value, xr_module.Dataset):
         names = list(value.data_vars)
         if not names:
             return f"{expr} is an xarray Dataset with no data variables to view"
-        child = _child_expr(_operand_expr(expr), names[0])
-        example = _view_command(child, quote=not _is_postfix_chain(expr)) or child
-        return f"{expr} is an xarray Dataset; view one of its variables, e.g. {example}"
+        key = _literal_node(names[0])
+        command = None
+        if node is not None and key is not None:
+            command = _view_command(ast.Subscript(value=node, slice=key, ctx=ast.Load()))
+        if command is None:
+            return (
+                f"{expr} is an xarray Dataset; view one of its data variables: "
+                f"{_format_name_list(names)[0]}"
+            )
+        return f"{expr} is an xarray Dataset; view one of its variables, e.g. {command}"
     if not _is_array(value):
         return None
     if value.ndim > 2:
-        operand = _operand_expr(expr)
-        if xr_module is not None and isinstance(value, xr_module.DataArray):
-            dim = value.dims[0]
-            if isinstance(dim, str) and dim.isidentifier() and not keyword.iskeyword(dim):
-                example = f"{operand}.isel({dim}=0)"
-            else:
-                example = f"{operand}.isel({{{dim!r}: 0}})"
-        else:
-            example = f"{operand}[0]"
+        example = None if node is None else _slice_example(value, node)
+        suggestion = "." if example is None else f", e.g. {example}"
         return (
             f"{expr} has {value.ndim} dimensions; the Data Explorer shows 1-D and 2-D arrays. "
-            f"Select a slice first, e.g. {example}"
+            f"Select a slice first{suggestion}"
         )
     if value.ndim in (1, 2):
         nbytes = _array_lazy_nbytes(value)
@@ -3028,57 +3038,62 @@ def _array_view_unavailable_message(value: Any, expr: str) -> str | None:
     return None
 
 
-def _child_expr(expr: str, name: Any) -> str:
-    """
-    An expression for the variable `name` of the Dataset that expr evaluates to.
-
-    Uses indexing, since attribute access resolves to a Dataset method or property of the same
-    name (e.g. a variable named "isel"). repr quotes a string with single quotes, so the result
-    can go inside a double-quoted %view argument.
-    """
-    return f"{expr}[{name!r}]"
-
-
-def _is_postfix_chain(expr: str) -> bool:
-    """
-    Whether expr is a name followed by any attribute accesses, subscripts, and calls.
-
-    Such an expression binds tighter than any suffix appended to it, e.g. `.isel(time=0)`.
-    """
+def _parse_expr(expr: str) -> ast.expr | None:
+    """The parsed expression expr, or None when it is not a single Python expression."""
     try:
-        node = ast.parse(expr.strip(), mode="eval").body
-    except SyntaxError:
-        return False
-    while True:
-        if isinstance(node, ast.Name):
-            return True
-        if isinstance(node, (ast.Attribute, ast.Subscript)):
-            node = node.value
-        elif isinstance(node, ast.Call):
-            node = node.func
-        else:
-            return False
+        return ast.parse(expr.strip(), mode="eval").body
+    except (SyntaxError, ValueError):
+        return None
 
 
-def _operand_expr(expr: str) -> str:
-    """expr, parenthesized unless a suffix appended to it applies to the whole expression."""
-    return expr if _is_postfix_chain(expr) else f"({expr})"
+def _literal_node(value: Any) -> ast.expr | None:
+    """A literal expression that evaluates to value, or None when value has no literal form."""
+    try:
+        # A str subclass such as numpy.str_ has a repr that is not a literal
+        text = repr(str(value)) if isinstance(value, str) else repr(value)
+        if not _objects_equal(ast.literal_eval(text), value):
+            return None
+        return ast.parse(text, mode="eval").body
+    except Exception:
+        return None
 
 
-def _view_command(expr: str, *, quote: bool) -> str | None:
+def _slice_example(value: Any, node: ast.expr) -> str | None:
+    """Code that selects the first slice along the first dim of value, which node evaluates to."""
+    xr_module = sys.modules.get("xarray")
+    if xr_module is None or not isinstance(value, xr_module.DataArray):
+        return ast.unparse(ast.Subscript(value=node, slice=ast.Constant(0), ctx=ast.Load()))
+    dim = value.dims[0]
+    isel = ast.Attribute(value=node, attr="isel", ctx=ast.Load())
+    if isinstance(dim, str) and dim.isidentifier() and not keyword.iskeyword(dim):
+        call = ast.Call(func=isel, args=[], keywords=[ast.keyword(arg=dim, value=ast.Constant(0))])
+    else:
+        key = _literal_node(dim)
+        if key is None:
+            return None
+        call = ast.Call(
+            func=isel, args=[ast.Dict(keys=[key], values=[ast.Constant(0)])], keywords=[]
+        )
+    return ast.unparse(call)
+
+
+def _view_command(node: ast.expr) -> str | None:
     """
-    A %view command for expr, or None when no quoting keeps expr as one argument.
+    A %view command that opens what node evaluates to, or None when no command can.
 
-    %view splits its arguments on whitespace and strips one pair of quotes around each, so expr
-    is quoted when asked or when it has whitespace or starts with a quote. Double quotes come
-    first, because Windows command-line splitting treats only double quotes as quotes.
+    ast.unparse adds the parentheses that operator precedence needs. IPython replaces `{expr}`
+    in a magic's arguments with the value of expr, so code with braces cannot be a %view
+    argument. %view splits its arguments on whitespace and strips one pair of quotes around each.
+    On Windows only double quotes quote an argument, and a double quote inside an argument is
+    removed, so code that has a double quote cannot be a %view argument either. Other code is
+    quoted with double quotes when it has whitespace or starts with a single quote.
     """
-    if not quote and not any(c.isspace() for c in expr) and expr[:1] not in "\"'":
-        return f"%view {expr}"
-    for mark in ('"', "'"):
-        if mark not in expr:
-            return f"%view {mark}{expr}{mark}"
-    return None
+    code = ast.unparse(node)
+    if any(c in code for c in '"{}'):
+        return None
+    if any(c.isspace() for c in code) or code.startswith("'"):
+        return f'%view "{code}"'
+    return f"%view {code}"
 
 
 class _ArrayTable:

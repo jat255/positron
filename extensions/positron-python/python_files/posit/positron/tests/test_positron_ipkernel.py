@@ -202,6 +202,57 @@ def test_view_dataset_expression_suggests_a_valid_command(shell: PositronShell, 
     assert capsys.readouterr().err == ""
 
 
+def test_view_expression_with_comment_suggests_runnable_code(shell: PositronShell, capsys) -> None:
+    np = pytest.importorskip("numpy")
+    xr = pytest.importorskip("xarray")
+    shell.user_ns["arr"] = xr.DataArray(np.zeros((2, 2, 2)), dims=("time", "y", "x"))
+    shell.run_cell('%view "arr # note"')
+    assert capsys.readouterr().err == (
+        "UsageError: arr # note has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. arr.isel(time=0)\n"
+    )
+    shell.run_cell("%view arr.isel(time=0)")
+    assert capsys.readouterr().err == ""
+
+    shell.user_ns["ds"] = xr.Dataset({"v": (("a", "b"), np.zeros((2, 2)))})
+    shell.run_cell('%view "ds # note"')
+    command = "%view ds['v']"
+    assert capsys.readouterr().err == (
+        f"UsageError: ds # note is an xarray Dataset; view one of its variables, e.g. {command}\n"
+    )
+    # The suggested command opens the variable, not the Dataset
+    shell.run_cell(command)
+    assert capsys.readouterr().err == ""
+
+
+def test_view_dataset_without_a_valid_command_lists_variables(shell: PositronShell, capsys) -> None:
+    np = pytest.importorskip("numpy")
+    xr = pytest.importorskip("xarray")
+    shell.user_ns["x"] = "other"
+    for name in ("a' \"b", "{x}"):
+        shell.user_ns["ds"] = xr.Dataset({name: (("a", "b"), np.zeros((2, 2)))})
+        shell.run_cell("%view ds")
+        assert capsys.readouterr().err == (
+            f"UsageError: ds is an xarray Dataset; view one of its data variables: {name}\n"
+        )
+
+
+def test_view_dataset_suggested_commands_run(shell: PositronShell, capsys) -> None:
+    np = pytest.importorskip("numpy")
+    xr = pytest.importorskip("xarray")
+    for name, command in (
+        ("a#b", "%view ds['a#b']"),
+        ("$HOME", "%view ds['$HOME']"),
+        ("my var", "%view \"ds['my var']\""),
+        ("isel", "%view ds['isel']"),
+    ):
+        shell.user_ns["ds"] = xr.Dataset({name: (("a", "b"), np.zeros((2, 2)))})
+        shell.run_cell("%view ds")
+        assert capsys.readouterr().err.endswith(f"e.g. {command}\n")
+        shell.run_cell(command)
+        assert capsys.readouterr().err == ""
+
+
 def test_view_array_over_size_limit_explains(shell: PositronShell, capsys) -> None:
     dask_array = pytest.importorskip("dask.array")
     shell.user_ns["big"] = dask_array.zeros((6000, 6000))  # never computed
