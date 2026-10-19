@@ -8,10 +8,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from ..data_explorer import (
     _VALUE_INF,
+    _VALUE_NA,
     _VALUE_NAN,
     _VALUE_NAT,
     _VALUE_NEGINF,
@@ -20,8 +22,15 @@ from ..data_explorer import (
     DataExplorerService,
     _value_type_is_supported,
 )
+from ..data_explorer_comm import SupportStatus
 from ..utils import guid
 from . import test_data_explorer
+from .test_data_explorer import (
+    _get_frequency_table,
+    _get_histogram,
+    _get_null_count,
+    _profile_request,
+)
 from .test_inspectors_xarray import make_dataset
 from .utils import json_rpc_request
 
@@ -101,7 +110,26 @@ def test_array_view_datetime_1d(dxf: DataExplorerFixture):
     schema = dxf.get_schema("time")
     assert schema[0]["type_display"] == "datetime"
     values = _column_values(dxf, "time", 0, da.sizes["time"])
-    assert values[0].startswith("2020-01-01")
+    series = pd.Series(da.values)
+    dxf.register_table("series", series)
+    expected = _column_values(dxf, "series", 0, len(series))
+    assert values == expected
+    assert values[0] == "2020-01-01 00:00:00"
+
+
+def test_array_view_unnamed_1d_dataarray_column_name(dxf: DataExplorerFixture):
+    xr = pytest.importorskip("xarray")
+    dxf.register_table("vec", xr.DataArray(np.array([1.0, 2.0]), dims=("x",)))
+    assert [c["column_name"] for c in dxf.get_schema("vec")] == ["0"]
+
+
+def test_array_view_masked_array(dxf: DataExplorerFixture):
+    arr = np.ma.array([[1.0, 2.0]], mask=[[False, True]])
+    dxf.register_table("arr", arr)
+    assert _column_values(dxf, "arr", 0, 1) == ["1.00"]
+    assert _column_values(dxf, "arr", 1, 1) == [_VALUE_NA]
+    result = dxf.get_column_profiles("arr", [_get_null_count(0), _get_null_count(1)])
+    assert [r["null_count"] for r in result] == [0, 1]
 
 
 def test_array_view_dtype_display(dxf: DataExplorerFixture):
@@ -180,3 +208,78 @@ def test_array_view_open_data_explorer(de_service: DataExplorerService):
     new_view = de_service.table_views[new_comm_ids[0]]
     assert isinstance(new_view, ArrayView)
     assert new_view.table.shape == (2, 3)
+
+
+def _summary(dxf: DataExplorerFixture, name: str, column_index: int):
+    request = _profile_request(column_index, [{"profile_type": "summary_stats"}])
+    return dxf.get_column_profiles(name, [request])[0]["summary_stats"]
+
+
+def test_array_view_summary_stats(dxf: DataExplorerFixture):
+    arr = np.array([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]])
+    dxf.register_table("arr", arr)
+    dxf.register_table("df", pd.DataFrame(arr))
+    for i in range(2):
+        assert _summary(dxf, "arr", i) == _summary(dxf, "df", i)
+    stats = _summary(dxf, "arr", 0)["number_stats"]
+    assert (stats["min_value"], stats["max_value"]) == ("1.00", "3.00")
+    assert (stats["mean"], stats["median"]) == ("2.00", "2.00")
+
+
+def test_array_view_summary_stats_other_dtypes(dxf: DataExplorerFixture):
+    cases = {
+        "ints": np.array([1, 2, 3, 4]),
+        "bools": np.array([True, False, True]),
+        "strs": np.array(["a", "", "b", "a"]),
+        "times": np.array(["2020-01-01", "2020-01-03", "2020-01-08"], dtype="datetime64[ns]"),
+    }
+    for name, arr in cases.items():
+        dxf.register_table(name, arr)
+        dxf.register_table(f"{name}_pd", pd.DataFrame({"0": arr}))
+        assert _summary(dxf, name, 0) == _summary(dxf, f"{name}_pd", 0), name
+
+
+def test_array_view_stats_ignore_nan(dxf: DataExplorerFixture):
+    arr = np.array([[1.0], [np.nan], [3.0]])
+    dxf.register_table("arr", arr)
+    result = dxf.get_column_profiles("arr", [_get_null_count(0)])
+    assert result[0]["null_count"] == 1
+    assert _summary(dxf, "arr", 0)["number_stats"]["mean"] == "2.00"
+
+
+def test_array_view_histogram(dxf: DataExplorerFixture):
+    arr = np.array([[1.0], [2.0], [2.5], [np.nan], [10.0]])
+    dxf.register_table("arr", arr)
+    dxf.register_table("df", pd.DataFrame(arr))
+    request = _get_histogram(0, bins=4)
+    result = dxf.get_column_profiles("arr", [request])[0]["small_histogram"]
+    assert result == dxf.get_column_profiles("df", [request])[0]["small_histogram"]
+    assert len(result["bin_edges"]) == 5
+    assert sum(result["bin_counts"]) == 4  # NaN excluded
+
+
+def test_array_view_histogram_datetime(dxf: DataExplorerFixture):
+    times = np.array(["2020-01-01", "2020-01-03", "2020-01-08"], dtype="datetime64[ns]")
+    dxf.register_table("times", times)
+    dxf.register_table("times_pd", pd.DataFrame({"0": times}))
+    request = _get_histogram(0, bins=3)
+    result = dxf.get_column_profiles("times", [request])[0]["small_histogram"]
+    assert result == dxf.get_column_profiles("times_pd", [request])[0]["small_histogram"]
+
+
+def test_array_view_frequency_table(dxf: DataExplorerFixture):
+    arr = np.array([3, 1, 3, 2, 3, 1])
+    dxf.register_table("arr", arr)
+    result = dxf.get_column_profiles("arr", [_get_frequency_table(0, 2)])
+    table = result[0]["small_frequency_table"]
+    assert table == {"values": ["3", "1"], "counts": [3, 2], "other_count": 1}
+
+
+def test_array_view_features():
+    f = ArrayView.FEATURES
+    assert f.get_column_profiles.support_status == SupportStatus.Supported
+    assert f.set_sort_columns.support_status == SupportStatus.Unsupported
+    assert f.set_row_filters.support_status == SupportStatus.Unsupported
+    assert f.search_schema.support_status == SupportStatus.Unsupported
+    assert f.export_data_selection.support_status == SupportStatus.Unsupported
+    assert f.convert_to_code.support_status == SupportStatus.Unsupported

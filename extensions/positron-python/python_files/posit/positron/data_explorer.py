@@ -2964,8 +2964,11 @@ class _ArrayTable:
         row_labels: list[str] | None,
         dims: tuple[str, ...],
         name: str | None,
+        mask: np.ndarray | None = None,
     ):
         self.values = values
+        # 2-D boolean array, True where a cell is masked (missing), or None
+        self.mask = mask
         self.shape: tuple[int, int] = (values.shape[0], values.shape[1])
         self.columns = columns
         self.row_labels = row_labels
@@ -2984,6 +2987,7 @@ class _ArrayTable:
 
         import numpy as np
 
+        mask = None
         xr_module = sys.modules.get("xarray")
         if xr_module is not None and isinstance(value, xr_module.DataArray):
             # .values computes a dask-backed DataArray
@@ -2994,6 +2998,10 @@ class _ArrayTable:
             row_labels = dim_labels[0]
             columns = ["0" if name is None else name] if value.ndim == 1 else dim_labels[1]
         else:
+            if isinstance(value, np.ma.MaskedArray):
+                # np.asarray would drop the mask
+                mask = np.ma.getmaskarray(value)
+                value = np.ma.getdata(value)
             # np.asarray computes a dask array
             values = np.asarray(value)
             dims = ()
@@ -3003,7 +3011,9 @@ class _ArrayTable:
 
         if values.ndim == 1:
             values = values.reshape(-1, 1)
-        return cls(values, columns, row_labels, dims, name)
+            if mask is not None:
+                mask = mask.reshape(-1, 1)
+        return cls(values, columns, row_labels, dims, name, mask)
 
     @staticmethod
     def _dim_labels(data_array: Any, dim: Any) -> list[str]:
@@ -3024,6 +3034,82 @@ _ARRAY_DTYPE_KIND_DISPLAY = MappingProxyType(
         "S": ColumnDisplayType.String,
     }
 )
+
+
+def _datetime64_formatter() -> Callable[[Any], str]:
+    """Return a function that formats a numpy datetime64 scalar the way pandas does."""
+    try:
+        import pandas as pd
+    except ImportError:
+        return lambda x: str(x).replace("T", " ")
+    return lambda x: str(pd.Timestamp(x))
+
+
+def _array_summarize_number(
+    values: np.ndarray, options: FormatOptions, display_type=ColumnDisplayType.Floating
+):
+    import numpy as np
+
+    float_format = _get_float_formatter(options)
+    math_helper = NumPyMathHelper()
+
+    min_val = max_val = median_val = mean_val = std_val = None
+    if len(values) > 0:
+        min_val = values.min()
+        max_val = values.max()
+
+        if not math_helper.isinf(min_val) and not math_helper.isinf(max_val):
+            # These stats are not defined when there is an inf/-inf in the data
+            mean_val = float_format(values.mean())
+            median_val = float_format(np.median(values))
+            # Matches pandas, which yields NaN for a single value
+            std_val = float_format(values.std(ddof=1)) if len(values) > 1 else float_format(np.nan)
+
+        if display_type == ColumnDisplayType.Floating:
+            min_val = float_format(min_val)
+            max_val = float_format(max_val)
+        else:
+            min_val = str(min_val)
+            max_val = str(max_val)
+
+    return _box_number_stats(
+        min_val, max_val, mean_val, median_val, std_val, display_type=display_type
+    )
+
+
+def _array_summarize_floating(values: np.ndarray, options: FormatOptions):
+    return _array_summarize_number(values, options, display_type=ColumnDisplayType.Floating)
+
+
+def _array_summarize_integer(values: np.ndarray, options: FormatOptions):
+    return _array_summarize_number(values, options, display_type=ColumnDisplayType.Integer)
+
+
+def _array_summarize_boolean(values: np.ndarray, _options: FormatOptions):
+    true_count = int(values.sum())
+    return _box_boolean_stats(true_count, len(values) - true_count)
+
+
+def _array_summarize_string(values: np.ndarray, _options: FormatOptions):
+    import numpy as np
+
+    num_empty = int(np.sum(np.char.str_len(values) == 0))
+    return _box_string_stats(num_empty, len(np.unique(values)))
+
+
+def _array_summarize_object(values: np.ndarray, _options: FormatOptions):
+    import numpy as np
+
+    return _box_other_stats(
+        len(np.unique(values.astype(str))), type_display=ColumnDisplayType.Object
+    )
+
+
+def _array_summarize_datetime(values: np.ndarray, options: FormatOptions):
+    # Reuse the pandas implementation so that formatting matches PandasView
+    import pandas as pd
+
+    return _pandas_summarize_datetime(pd.Series(values), options)
 
 
 class ArrayView(DataExplorerTableView):
@@ -3074,22 +3160,34 @@ class ArrayView(DataExplorerTableView):
     ) -> dict:
         np = self.math_helper.np
 
-        is_nat: Callable[[Any], bool] = (
-            np.isnat if self._values.dtype.kind in "mM" else (lambda _x: False)
-        )
+        kind = self._values.dtype.kind
+        is_nat: Callable[[Any], bool] = np.isnat if kind in "mM" else (lambda _x: False)
         _format_value = _get_value_formatter(
             format_options, self.math_helper, is_nat=is_nat, is_na=lambda _x: False
         )
+        if kind == "M":
+            # Render datetimes the way pandas does, e.g. "2020-01-01 00:00:00"
+            _format_scalar = _format_value
+            _to_timestamp = _datetime64_formatter()
+            _format_value = lambda x: (  # noqa: E731
+                _format_scalar(x) if is_nat(x) else _to_timestamp(x)
+            )
 
         formatted_columns = []
         for selection in selections:
             col = self._values[:, selection.column_index]
+            mask = self._get_mask(selection.column_index)
             spec = selection.spec
             if isinstance(spec, DataSelectionRange):
-                values = col[spec.first_index : spec.last_index + 1]
+                rows = slice(spec.first_index, spec.last_index + 1)
             else:
-                values = col.take(spec.indices)
-            formatted_columns.append([_format_value(x) for x in values])
+                rows = np.asarray(spec.indices, dtype=np.intp)
+            values = col[rows]
+            masked = None if mask is None else mask[rows]
+            formatted = [_format_value(x) for x in values]
+            if masked is not None:
+                formatted = [_VALUE_NA if m else v for v, m in zip(formatted, masked)]
+            formatted_columns.append(formatted)
 
         # Bypass pydantic model for speed
         return {"columns": formatted_columns}
@@ -3111,11 +3209,133 @@ class ArrayView(DataExplorerTableView):
         return state
 
     def get_updated_state(self, new_table) -> StateUpdate:  # noqa: ARG002
+        # _update_explorer_for_comm only calls this for _ArrayTable inputs, so variable updates
+        # normally take the full schema-update path.
         # Any change to an array is treated as a full schema update
         return True, DataExplorerState(self.state.name)
 
-    # Sorting, filtering, profiles, export, and code conversion are not supported for arrays
-    FEATURES = DataExplorerTableView.FEATURES
+    def _get_mask(self, column_index: int) -> np.ndarray | None:
+        mask = self.table.mask
+        return None if mask is None else mask[:, column_index]
+
+    def _get_column(self, column_index: int) -> np.ndarray:
+        """Return one column as a 1-D array, a masked array when the table has masked cells."""
+        col = self._values[:, column_index]
+        mask = self._get_mask(column_index)
+        if mask is None:
+            return col
+        return self.math_helper.np.ma.array(col, mask=mask)
+
+    def _get_valid_values(self, column_index: int) -> np.ndarray:
+        """Return a column's values without masked, NaN, or NaT cells."""
+        np = self.math_helper.np
+        col = self._get_column(column_index)
+        if isinstance(col, np.ma.MaskedArray):
+            col = col.compressed()
+        if col.dtype.kind in "fcmM":
+            col = col[~np.isnan(col) if col.dtype.kind in "fc" else ~np.isnat(col)]
+        return col
+
+    def _prof_null_count(self, column_index: int) -> int:
+        return len(self._values) - len(self._get_valid_values(column_index))
+
+    def _prof_summary_stats(self, column_index: int, options: FormatOptions) -> ColumnSummaryStats:
+        col_schema = self._get_single_column_schema(column_index)
+        handler = self._SUMMARIZERS.get(col_schema.type_display, _summarize_not_implemented)
+        return handler(self._get_valid_values(column_index), options)
+
+    _SUMMARIZERS = MappingProxyType(
+        {
+            ColumnDisplayType.Boolean: _array_summarize_boolean,
+            ColumnDisplayType.Floating: _array_summarize_floating,
+            ColumnDisplayType.Integer: _array_summarize_integer,
+            ColumnDisplayType.String: _array_summarize_string,
+            ColumnDisplayType.Datetime: _array_summarize_datetime,
+            ColumnDisplayType.Object: _array_summarize_object,
+        }
+    )
+
+    def _format_values(self, values, options: FormatOptions) -> list[ColumnValue]:
+        # Profile values never contain NaT or masked cells
+        if self._values.dtype.kind == "M":
+            _to_timestamp = _datetime64_formatter()
+            return [_to_timestamp(x) for x in values]
+        _format_value = _get_value_formatter(
+            options, self.math_helper, is_nat=lambda _x: False, is_na=lambda _x: False
+        )
+        return [_format_value(x) for x in values]
+
+    def _prof_freq_table(
+        self,
+        column_index: int,
+        params: ColumnFrequencyTableParams,
+        format_options: FormatOptions,
+    ) -> ColumnFrequencyTable:
+        np = self.math_helper.np
+        values, counts = np.unique(self._get_valid_values(column_index), return_counts=True)
+        # Most frequent first, ties in ascending value order
+        order = np.argsort(-counts, kind="stable")
+        top = order[: params.limit]
+        other = order[params.limit :]
+
+        return ColumnFrequencyTable(
+            values=self._format_values(values[top], format_options),
+            counts=[int(x) for x in counts[top]],
+            other_count=int(counts[other].sum()),
+        )
+
+    def _prof_histogram(
+        self,
+        column_index: int,
+        params: ColumnHistogramParams,
+        format_options: FormatOptions,
+    ) -> ColumnHistogram:
+        np = self.math_helper.np
+
+        data = self._get_valid_values(column_index)
+        dtype = data.dtype
+        is_datetime64 = dtype.kind == "M"
+        if is_datetime64:
+            data = data.view(np.int64)
+
+        method = _get_histogram_method(params.method)
+        bin_counts, bin_edges = _get_histogram_numpy(data, params.num_bins, method=method)
+
+        if is_datetime64:
+            bin_edges = np.floor(bin_edges).astype(np.int64).view(dtype)
+
+        formatted_edges = self._format_values(bin_edges, format_options)
+
+        return ColumnHistogram(
+            bin_edges=[str(x) for x in formatted_edges],
+            bin_counts=[int(x) for x in bin_counts],
+            quantiles=[],
+        )
+
+    # Sorting, filtering, search, export, and code conversion are not supported for arrays
+    FEATURES = SupportedFeatures(
+        search_schema=DataExplorerTableView.FEATURES.search_schema,
+        set_column_filters=DataExplorerTableView.FEATURES.set_column_filters,
+        set_row_filters=DataExplorerTableView.FEATURES.set_row_filters,
+        get_column_profiles=GetColumnProfilesFeatures(
+            support_status=SupportStatus.Supported,
+            supported_types=[
+                ColumnProfileTypeSupportStatus(
+                    profile_type=profile_type,
+                    support_status=SupportStatus.Supported,
+                )
+                for profile_type in (
+                    ColumnProfileType.NullCount,
+                    ColumnProfileType.SummaryStats,
+                    ColumnProfileType.SmallHistogram,
+                    ColumnProfileType.SmallFrequencyTable,
+                )
+            ],
+        ),
+        set_sort_columns=DataExplorerTableView.FEATURES.set_sort_columns,
+        export_data_selection=DataExplorerTableView.FEATURES.export_data_selection,
+        convert_to_code=DataExplorerTableView.FEATURES.convert_to_code,
+    )
 
 
 def _get_table_view(

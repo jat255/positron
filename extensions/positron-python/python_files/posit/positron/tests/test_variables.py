@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import time
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import ANY, Mock
@@ -976,6 +978,30 @@ def test_query_table_summary(shell: PositronShell, variables_comm: DummyComm):
             }
         )
     ]
+
+
+def test_query_table_summary_xarray(
+    shell: PositronShell, variables_comm: DummyComm, caplog: pytest.LogCaptureFixture
+):
+    xr = pytest.importorskip("xarray")
+    da = xr.DataArray(np.arange(6.0).reshape(2, 3), dims=("y", "x"), name="z")
+    _assign_variables(shell, variables_comm, da=da)
+
+    msg = json_rpc_request(
+        "query_table_summary",
+        {"path": ["da"], "query_types": ["summary_stats"]},
+        comm_id="dummy_comm_id",
+    )
+    with caplog.at_level(logging.WARNING):
+        variables_comm.handle_msg(msg)
+
+    result = variables_comm.messages[-1]["data"]["result"]
+    assert (result["num_rows"], result["num_columns"]) == da.shape
+    profiles = [json.loads(p) for p in result["column_profiles"]]
+    assert len(profiles) == 3
+    for profile in profiles:
+        assert profile["summary_stats"]["number_stats"] is not None
+    assert not [r for r in caplog.records if "nsupported" in r.getMessage()]
 
 
 def test_unknown_method(variables_comm: DummyComm) -> None:
