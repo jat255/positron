@@ -3236,33 +3236,51 @@ def _count_objects(values: Iterable[Any]) -> tuple[list[Any], list[int]]:
     """
     Count the distinct values of an object column by value equality, in order of first appearance.
 
-    Values do not need to be orderable. Each unhashable value is compared with `==` to the
-    unhashable values seen before it; a comparison that raises or does not return a bool counts as
-    not equal.
+    Values do not need to be orderable or hashable. Equal values count as one even when one is
+    hashable and the other is not, e.g. {1} and frozenset({1}). A comparison that raises or does
+    not return a bool counts as not equal.
     """
     # Each distinct value, with its count, in order of first appearance
     uniques: list[Any] = []
     counts: list[int] = []
-    # Index into uniques of each hashable value
+    # Index into uniques of each hashable value seen, for the fast path
     hashable_index: dict[Any, int] = {}
-    # Indices into uniques of the unhashable values
+    # Indices into uniques of the values that could not go in hashable_index
     unhashable_indices: list[int] = []
     for value in values:
         try:
             index = hashable_index.get(value)
-        except TypeError:
-            index = next((i for i in unhashable_indices if _objects_equal(uniques[i], value)), None)
-            if index is None:
-                unhashable_indices.append(len(uniques))
-        else:
-            if index is None:
-                hashable_index[value] = len(uniques)
+            hashable = True
+        except Exception:
+            # Unhashable, or a hash collision whose comparison raised
+            index = None
+            hashable = False
         if index is None:
-            uniques.append(value)
-            counts.append(1)
-        else:
-            counts[index] += 1
+            # Hashable values only need comparing with the values outside the hash table; other
+            # values need comparing with every distinct value
+            candidates = unhashable_indices if hashable else range(len(uniques))
+            match = next((i for i in candidates if _objects_equal(uniques[i], value)), None)
+            if match is None:
+                index = len(uniques)
+                uniques.append(value)
+                counts.append(0)
+            else:
+                index = match
+            # Later equal hashable values then take the fast path
+            cached = hashable and _try_set_item(hashable_index, value, index)
+            if match is None and not cached:
+                unhashable_indices.append(index)
+        counts[index] += 1
     return uniques, counts
+
+
+def _try_set_item(mapping: dict[Any, int], key: Any, value: int) -> bool:
+    """Set mapping[key] = value, returning False when a comparison of keys raises."""
+    try:
+        mapping[key] = value
+    except Exception:
+        return False
+    return True
 
 
 def _objects_equal(a: Any, b: Any) -> bool:

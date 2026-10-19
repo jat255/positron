@@ -548,6 +548,25 @@ def test_count_objects_unhashable_by_equality():
     assert uniques[1][0] is second
 
 
+class _HashableRaisingEq:
+    def __hash__(self) -> int:
+        return 0
+
+    def __eq__(self, other: object) -> bool:
+        raise ValueError("no comparison")
+
+
+def test_count_objects_equality_across_hashable_and_unhashable():
+    # A set and a frozenset with the same items are equal, in either order
+    assert _count_objects([{1}, frozenset({1})]) == ([{1}], [2])
+    assert _count_objects([frozenset({1}), {1}]) == ([frozenset({1})], [2])
+    values = [1, {"a": 1}, 1.0, frozenset({1}), {"a": 1}, True, {1}, [1], (1,)]
+    assert _count_objects(values) == ([1, {"a": 1}, frozenset({1}), [1], (1,)], [3, 2, 2, 1, 1])
+    # A hashable value whose == raises counts as not equal, also inside the hash table
+    a, b = _HashableRaisingEq(), _HashableRaisingEq()
+    assert _count_objects([a, b, {1}])[1] == [1, 1, 1]
+
+
 def test_array_view_object_unhashable_equal_values(dxf: DataExplorerFixture):
     arr = np.empty(2, dtype=object)
     arr[0] = {"a": 1, "b": 2}
