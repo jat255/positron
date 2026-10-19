@@ -371,7 +371,7 @@ def test_dask_equals_detects_attr_change():
     assert not ins.equals(snapshot)
 
 
-def test_dask_comparison_cost_counts_eager_coordinates_only():
+def test_dask_comparison_cost_counts_eager_coordinates():
     ds = make_lazy_dataset()
     coord_bytes = sum(ds[name].nbytes for name in ("time", "lat", "lon"))
     assert get_inspector(ds).get_comparison_cost() == coord_bytes
@@ -391,3 +391,52 @@ def test_dask_equals_detects_in_place_edit_of_original():
     snapshot = get_inspector(da).deepcopy()
     da[0, 0, 0] = 1
     assert not get_inspector(snapshot).equals(da)
+
+
+def test_indexes_row_truncates_long_name_lists():
+    names = [f"dimension_{i:04d}" for i in range(5000)]
+    ds = xr.Dataset(coords={name: [0] for name in names})
+    text = get_inspector(get_inspector(ds).get_child("Indexes")).get_display_value()[0]
+    assert text == _format_name_list(names)[0]
+    assert len(text) < len(", ".join(names))
+
+
+def make_mixed_lazy_dataset() -> xr.Dataset:
+    """A dask-backed Dataset that also has an eager data variable and an eager coordinate."""
+    ds = make_lazy_dataset()
+    ds["mask"] = ("time", np.zeros(12))
+    ds.coords["depth"] = ("lat", np.zeros(3))
+    return ds
+
+
+def test_dask_equals_detects_replaced_eager_data_variable():
+    ds = make_mixed_lazy_dataset()
+    snapshot = get_inspector(ds).deepcopy()
+    assert get_inspector(snapshot).equals(ds)
+    ds["mask"] = ("time", np.ones(12))
+    assert not get_inspector(snapshot).equals(ds)
+
+
+def test_dask_equals_detects_in_place_edit_of_eager_data_variable():
+    ds = make_mixed_lazy_dataset()
+    snapshot = get_inspector(ds).deepcopy()
+    ds["mask"][0] = 5
+    assert not get_inspector(snapshot).equals(ds)
+
+
+def test_dask_equals_detects_in_place_edit_of_eager_coordinate():
+    ds = make_mixed_lazy_dataset()
+    snapshot = get_inspector(ds).deepcopy()
+    ds["depth"][0] = 5
+    assert not get_inspector(snapshot).equals(ds)
+
+    da = ds["sst"]
+    snapshot = get_inspector(da).deepcopy()
+    da["depth"][0] = 7
+    assert not get_inspector(snapshot).equals(da)
+
+
+def test_dask_comparison_cost_counts_eager_data_variables():
+    ds = make_mixed_lazy_dataset()
+    eager = ("time", "lat", "lon", "depth", "mask")
+    assert get_inspector(ds).get_comparison_cost() == sum(ds[name].nbytes for name in eager)

@@ -1559,7 +1559,8 @@ def _xarray_lazy_equals(a: Any, b: Any) -> bool:
     Compare xarray objects when either one is dask-backed, without computing anything.
 
     Compares structure, names, and attrs; each chunked variable by its dask name (the graph
-    token, which a copy keeps); and eager coordinates by value.
+    token, which a copy keeps); and every other variable (data variables and coordinates) by
+    value.
     """
     if type(a) is not type(b):
         return False
@@ -1588,7 +1589,7 @@ def _xarray_lazy_equals(a: Any, b: Any) -> bool:
                 return False
             if getattr(var_a.data, "name", None) != getattr(var_b.data, "name", None):
                 return False
-        elif name in a.coords and not var_a.identical(var_b):
+        elif not var_a.identical(var_b):
             return False
     return True
 
@@ -1601,14 +1602,27 @@ def _xarray_lazy_copy(value: Any) -> Any:
     # gives the array it is called on a new name, so a shared object would pass the new name on
     # to the snapshot too. A shallow copy of each dask Array is a new object with the same name
     # and graph, and computes nothing.
-    for variable in _xarray_variables(out).values():
+    # A shallow copy also shares the buffers of eager variables, so an in-place edit of the
+    # original would show up in the snapshot. Each eager variable other than an index gets a deep
+    # copy. Index variables are immutable.
+    index_variable = sys.modules["xarray"].IndexVariable
+    for name, variable in _xarray_variables(out).items():
         if variable.chunks is not None and _is_dask_array(variable.data):
             variable.data = copy.copy(variable.data)
+        elif name is not None and not isinstance(variable, index_variable):
+            owned = variable.copy(deep=True)
+            if name in out.coords:
+                out.coords[name] = owned
+            else:
+                out[name] = owned
     return out
 
 
-def _eager_coordinate_nbytes(value: Any) -> int:
-    return sum(coord.nbytes for coord in value.coords.values() if coord.chunks is None)
+def _eager_variable_nbytes(value: Any) -> int:
+    """The bytes of every variable of an xarray object that is not chunked."""
+    return sum(
+        variable.nbytes for variable in _xarray_variables(value).values() if variable.chunks is None
+    )
 
 
 class MetadataRow:
@@ -1799,14 +1813,14 @@ class XarrayDatasetInspector(PositronInspector["xr.Dataset"]):
             text = ", ".join(f"{dim}: {size}" for dim, size in ds.sizes.items())
             return MetadataRow(text or _NONE_TEXT)
         if key == self.INDEXES:
-            return MetadataRow(", ".join(str(name) for name in ds.indexes) or _NONE_TEXT)
+            return MetadataRow(_format_name_list(ds.indexes)[0] or _NONE_TEXT)
         if key in self.get_children():
             return ArrayGroup(key, ds)
         raise KeyError(key)
 
     def get_comparison_cost(self) -> int:
         if _is_dask_backed(self.value):
-            return _eager_coordinate_nbytes(self.value)
+            return _eager_variable_nbytes(self.value)
         return self.value.nbytes
 
     def equals(self, value: xr.Dataset) -> bool:
@@ -1877,7 +1891,7 @@ class XarrayDataArrayInspector(PositronInspector["xr.DataArray"]):
 
     def get_comparison_cost(self) -> int:
         if _is_dask_backed(self.value):
-            return _eager_coordinate_nbytes(self.value)
+            return _eager_variable_nbytes(self.value)
         return self.value.nbytes
 
     def equals(self, value: xr.DataArray) -> bool:
