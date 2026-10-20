@@ -144,6 +144,19 @@ def test_array_view_axis_names_without_row_coordinate(dxf: DataExplorerFixture):
     assert dxf.get_state("v")["row_axis_name"] == "y"
 
 
+def test_array_view_axis_names_of_variables(dxf: DataExplorerFixture):
+    ds = make_dataset()
+    dxf.register_table("grid", ds.variables["sst"][0])
+    state = dxf.get_state("grid")
+    assert (state["row_axis_name"], state["column_axis_name"]) == ("lat", "lon")
+
+    # An unnamed IndexVariable's column is "0", so the corner names the dim its rows run along.
+    dxf.register_table("t", ds.variables["time"])
+    state = dxf.get_state("t")
+    assert state["row_axis_name"] == "time"
+    assert state.get("column_axis_name") is None
+
+
 def test_array_view_datetime_1d(dxf: DataExplorerFixture):
     da = make_dataset()["time"]
     dxf.register_table("time", da)
