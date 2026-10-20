@@ -101,4 +101,17 @@ describe('DataGridCornerTopLeft', () => {
 		expect(screen.queryByTestId('data-grid-corner-top-left-content')).not.toBeInTheDocument();
 		expect(screen.getByTestId('vertical-splitter')).toBeInTheDocument();
 	});
+
+	it('offers the scroll tooltip only on an empty corner', () => {
+		// Corner content shows its own hover; an empty corner keeps the "Scroll to top-left" one.
+		renderCorner(undefined);
+
+		expect(screen.getByTitle('Scroll to top-left')).toBeInTheDocument();
+	});
+
+	it('leaves the hover to the corner content when there is some', () => {
+		renderCorner(<span>lat by lon</span>);
+
+		expect(screen.queryByTitle('Scroll to top-left')).not.toBeInTheDocument();
+	});
 });

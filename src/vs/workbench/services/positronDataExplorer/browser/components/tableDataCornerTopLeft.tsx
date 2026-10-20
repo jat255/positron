@@ -56,20 +56,16 @@ export const TableDataCornerTopLeft = (props: TableDataCornerTopLeftProps) => {
 	// The names truncate when the row headers are narrow, so the hover gives them in full.
 	const hoverText = axisNamesHoverText(props.rowAxisName, props.columnAxisName);
 
-	// Show the hover while the mouse is over the names. The mouseover listener stops propagation
-	// so the corner's own "Scroll to top-left" hover does not replace this one.
+	// Show the hover while the mouse is over the names.
 	useEffect(() => {
 		const element = ref.current;
 		const hoverManager = props.hoverManager;
-		const showHover = (e: MouseEvent) => {
-			e.stopPropagation();
-			hoverManager.showHover(element, hoverText);
-		};
+		const showHover = () => hoverManager.showHover(element, hoverText);
 		const hideHover = () => hoverManager.hideHover();
-		element.addEventListener('mouseover', showHover);
+		element.addEventListener('mouseenter', showHover);
 		element.addEventListener('mouseleave', hideHover);
 		return () => {
-			element.removeEventListener('mouseover', showHover);
+			element.removeEventListener('mouseenter', showHover);
 			element.removeEventListener('mouseleave', hideHover);
 		};
 	}, [hoverText, props.hoverManager]);
