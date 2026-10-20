@@ -24,6 +24,7 @@ from positron.inspectors import (
     _format_nbytes,
     _is_dask_backed,
     _is_own_coordinate,
+    _preview_item_formatter,
     get_inspector,
 )
 
@@ -214,6 +215,19 @@ def make_lazily_indexed_dataarray(shape: tuple[int, ...]) -> tuple[xr.DataArray,
     return xr.DataArray(variable), backend
 
 
+def _full_array_preview(values: np.ndarray) -> str:
+    """The preview text of an array formatted in full, to compare with the edge-items preview."""
+    threshold = 100 if values.size <= 100 else 0
+    text = np.array2string(
+        values,
+        threshold=threshold,
+        edgeitems=3,
+        separator=", ",
+        formatter={"all": _preview_item_formatter(values.dtype)},
+    )
+    return " ".join(text.split())
+
+
 def test_values_preview_reads_only_edge_items():
     shape = (200, 300, 400)
     da, backend = make_lazily_indexed_dataarray(shape)
@@ -221,14 +235,13 @@ def test_values_preview_reads_only_edge_items():
     # At most 7 items per dim are read: 3 shown at each edge, plus one hidden by the ellipsis.
     assert 0 < backend.elements_read <= 7**3
     # The preview matches numpy's own summary of the full array.
-    expected = np.array2string(backend.array, threshold=100, edgeitems=3, separator=", ")
-    assert preview == " ".join(expected.split())
+    assert preview == _full_array_preview(backend.array)
 
 
 def test_values_preview_small_array_unchanged():
     da = xr.DataArray(np.arange(10.0), dims=("x",))
     preview = get_inspector(get_inspector(da).get_child("Values")).get_display_value()[0]
-    assert preview == "[0., 1., 2., 3., 4., 5., 6., 7., 8., 9.]"
+    assert preview == "[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]"
 
 
 def test_values_preview_mixed_dim_lengths():
@@ -236,8 +249,7 @@ def test_values_preview_mixed_dim_lengths():
     da, backend = make_lazily_indexed_dataarray(shape)
     preview = get_inspector(get_inspector(da).get_child("Values")).get_display_value()[0]
     assert backend.elements_read <= 2 * 7 * 4
-    expected = np.array2string(backend.array, threshold=100, edgeitems=3, separator=", ")
-    assert preview == " ".join(expected.split())
+    assert preview == _full_array_preview(backend.array)
 
 
 #
@@ -693,8 +705,11 @@ def test_values_preview_datetime_without_pandas(monkeypatch: pytest.MonkeyPatch)
     da = make_dataset()["time"]
     monkeypatch.setitem(sys.modules, "pandas", None)  # type: ignore
     preview = _values_preview(da)
-    expected = np.array2string(da.to_numpy(), threshold=100, edgeitems=3, separator=", ")
-    assert preview == " ".join(expected.split())
+    # numpy's own string for each item, without quotes. The datetime unit (ns or us) depends
+    # on the xarray and pandas versions.
+    assert preview == "[" + ", ".join(str(item) for item in da.to_numpy()) + "]"
+    assert preview.startswith("[2020-01-01T00:00:00.")
+    assert "'" not in preview
 
 
 def test_values_preview_datetime_reads_only_edge_items():
@@ -718,44 +733,85 @@ def test_values_preview_separates_numbers_with_commas():
     lat = xr.DataArray(np.arange(20.125, 55, 0.25), dims=("lat",), name="lat")
     assert _values_preview(lat) == "[20.125, 20.375, 20.625, ..., 54.375, 54.625, 54.875]"
     ints = xr.DataArray(np.arange(366), dims=("time",))
-    # numpy pads items to a common width; the preview collapses the padding to one space.
-    assert _values_preview(ints) == "[ 0, 1, 2, ..., 363, 364, 365]"
+    assert _values_preview(ints) == "[0, 1, 2, ..., 363, 364, 365]"
 
 
 def test_values_preview_separates_2d_rows_with_commas():
     small = xr.DataArray(np.arange(6).reshape(2, 3), dims=("y", "x"))
     assert _values_preview(small) == "[[0, 1, 2], [3, 4, 5]]"
     big = xr.DataArray(np.arange(200 * 300).reshape(200, 300), dims=("y", "x"))
-    expected = np.array2string(big.to_numpy(), threshold=100, edgeitems=3, separator=", ")
-    assert _values_preview(big) == " ".join(expected.split())
-    assert _values_preview(big).startswith("[[ 0, 1, 2, ..., 297, 298, 299], ")
+    assert _values_preview(big).startswith("[[0, 1, 2, ..., 297, 298, 299], [300, 301, ")
+    assert _values_preview(big) == _full_array_preview(big.to_numpy())
+
+
+def test_values_preview_float32_precision_without_padding():
+    # Values decoded from files are often one float32 step away from the decimal they stand
+    # for, e.g. 28.019999 for 28.02. The preview shows the digits float32 resolves.
+    row = np.full(30, 24.0, dtype="float32")
+    row[:3] = [28.02, 27.89, 27.77]
+    row[-3:] = [23.46, 23.4, 23.35]
+    row[0] = np.nextafter(row[0], np.float32(0))
+    row[2] = np.nextafter(row[2], np.float32(0))
+    assert repr(row[0]) == "np.float32(28.019999)" or str(row[0]) == "28.019999"
+    values = np.stack([row - np.float32(i) for i in range(4)])
+    assert values.dtype == np.float32
+    preview = _values_preview(xr.DataArray(values, dims=("lat", "lon")))
+    assert preview == (
+        "[[28.02, 27.89, 27.77, ..., 23.46, 23.4, 23.35],"
+        " [27.02, 26.89, 26.77, ..., 22.46, 22.4, 22.35],"
+        " [26.02, 25.89, 25.77, ..., 21.46, 21.4, 21.35],"
+        " [25.02, 24.89, 24.77, ..., 20.46, 20.4, 20.35]]"
+    )
+    assert "9999" not in preview
+    assert " ," not in preview
 
 
 @pytest.mark.parametrize(
-    "values",
+    ("values", "expected"),
     [
-        pytest.param(np.array([True, False, True]), id="bool"),
-        pytest.param(np.arange(3), id="int"),
-        pytest.param(np.array([0.5, 1.5, np.nan]), id="float"),
-        pytest.param(np.array([1 + 2j, 3 - 4j]), id="complex"),
-        pytest.param(np.array(["a", "b c"]), id="str"),
-        pytest.param(np.array(["a", None, 3], dtype=object), id="object"),
-        pytest.param(np.arange(200.0), id="float-summarized"),
-        pytest.param(np.arange(24).reshape(2, 3, 4), id="3d"),
-        pytest.param(np.arange(10 * 10 * 10).reshape(10, 10, 10), id="3d-summarized"),
+        pytest.param(np.array([True, False, True]), "[True, False, True]", id="bool"),
+        pytest.param(np.arange(3), "[0, 1, 2]", id="int"),
+        pytest.param(np.array([1, 200], dtype="uint8"), "[1, 200]", id="uint"),
+        pytest.param(np.array([0.5, 1.5, np.nan, -np.inf]), "[0.5, 1.5, nan, -inf]", id="float"),
+        pytest.param(np.array([0.1, 2.5], dtype="float16"), "[0.1, 2.5]", id="float16"),
+        pytest.param(np.array([0.1, 1e-7], dtype="float32"), "[0.1, 1e-07]", id="float32"),
+        pytest.param(np.array([1 / 3, 1e20]), "[0.333333333333333, 1e+20]", id="float64"),
+        pytest.param(np.array([1 + 2j, 3 - 4.5j]), "[1.0+2.0j, 3.0-4.5j]", id="complex"),
+        pytest.param(np.array(["a", "b c"]), "['a', 'b c']", id="str"),
+        pytest.param(np.array([b"a", b"bc"]), "[b'a', b'bc']", id="bytes"),
+        pytest.param(
+            np.array(["a", None, 3, 1.5], dtype=object), "['a', None, 3, 1.5]", id="object"
+        ),
+        pytest.param(
+            np.arange(200.0), "[0.0, 1.0, 2.0, ..., 197.0, 198.0, 199.0]", id="float-summarized"
+        ),
+        pytest.param(
+            np.arange(12).reshape(2, 2, 3),
+            "[[[0, 1, 2], [3, 4, 5]], [[6, 7, 8], [9, 10, 11]]]",
+            id="3d",
+        ),
     ],
 )
-def test_values_preview_uses_commas_for_every_dtype(values: np.ndarray):
+def test_values_preview_formats_every_dtype(values: np.ndarray, expected: str):
     preview = get_inspector(ArrayGroup("Values", xr.DataArray(values))).get_display_value()[0]
-    threshold = 100 if values.size <= 100 else 0
-    expected = np.array2string(values, threshold=threshold, edgeitems=3, separator=", ")
-    assert preview == " ".join(expected.split())
-    assert ", " in preview
+    assert preview == expected
+
+
+def test_values_preview_3d_summarized():
+    values = np.arange(10 * 10 * 10).reshape(10, 10, 10)
+    preview = _values_preview(xr.DataArray(values))
+    assert preview.startswith("[[[0, 1, 2, ..., 7, 8, 9], [10, 11, 12, ..., 17, 18, 19], ")
+    assert preview == _full_array_preview(values)
+    assert " ," not in preview
 
 
 def test_values_preview_0d():
     da = xr.DataArray(np.float64(2.5))
     assert get_inspector(ArrayGroup("Values", da)).get_display_value()[0] == "2.5"
+    da = xr.DataArray(np.float32(28.02))
+    assert get_inspector(ArrayGroup("Values", da)).get_display_value()[0] == "28.02"
+    da = xr.DataArray(np.int64(3))
+    assert get_inspector(ArrayGroup("Values", da)).get_display_value()[0] == "3"
 
 
 #

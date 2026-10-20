@@ -1715,28 +1715,67 @@ def _edge_values(array: xr.DataArray) -> np.ndarray:
     return _numpy().block(block(()))
 
 
-def _pandas_time_formatters() -> tuple[Callable[[Any], str], Callable[[Any], str]] | None:
+def _pandas_time_formatter(kind: str) -> Callable[[Any], str] | None:
     """
-    Format functions that show datetime64 and timedelta64 items as pandas does.
+    A function that shows a datetime64 or timedelta64 item as pandas does.
 
-    numpy shows them as quoted ISO strings with nanoseconds (`'2020-01-01T00:00:00.000000000'`).
-    Returns None when pandas has not been imported, so that numpy's own format applies.
+    `kind` is the dtype kind, "M" or "m". The result reads like "2020-01-01 00:00:00". Returns
+    None when pandas has not been imported.
     """
     pd_mod = sys.modules.get("pandas")
     if pd_mod is None:
         return None
+    convert = pd_mod.Timestamp if kind == "M" else pd_mod.Timedelta
 
-    def format_with(convert: Callable[[Any], Any]) -> Callable[[Any], str]:
-        def format_item(item: Any) -> str:
-            try:
-                return str(convert(item))
-            except (ValueError, OverflowError):
-                # For example, a date outside the range of pandas' nanosecond timestamps.
-                return str(item)
+    def format_item(item: Any) -> str:
+        try:
+            return str(convert(item))
+        except (ValueError, OverflowError):
+            # For example, a date outside the range of pandas' nanosecond timestamps.
+            return str(item)
 
-        return format_item
+    return format_item
 
-    return format_with(pd_mod.Timestamp), format_with(pd_mod.Timedelta)
+
+def _format_float(value: Any, digits: int) -> str:
+    """A float with at most `digits` significant digits; integral values keep a ".0"."""
+    text = f"{float(value):.{digits}g}"
+    if text.lstrip("-").isdigit():
+        text += ".0"
+    return text
+
+
+def _preview_item_formatter(dtype: Any) -> Callable[[Any], str]:
+    """
+    A function that formats one item of an array of `dtype` for the values preview.
+
+    Items are not padded to a common width. A float shows the significant digits its dtype
+    resolves (`np.finfo(dtype).precision`): a float32 decoded from a file as 28.019999, one
+    float32 step from 28.02, shows as 28.02.
+    """
+    kind = dtype.kind
+    if kind in "mM":
+        return _pandas_time_formatter(kind) or str
+    if kind == "f":
+        digits = _numpy().finfo(dtype).precision
+        return lambda item: _format_float(item, digits)
+    if kind == "c":
+        digits = _numpy().finfo(dtype).precision
+
+        def format_complex(item: Any) -> str:
+            imag = _format_float(abs(item.imag), digits)
+            sign = "-" if item.imag < 0 else "+"
+            return f"{_format_float(item.real, digits)}{sign}{imag}j"
+
+        return format_complex
+    if kind == "U":
+        return lambda item: repr(str(item))
+
+    def format_other(item: Any) -> str:
+        # Quote strings in object arrays; str() gives numpy scalars their plain form
+        return repr(str(item)) if isinstance(item, str) else str(item)
+
+    return format_other
 
 
 def _array_values_preview(array: xr.DataArray, *, level: int = 0) -> tuple[str, bool]:
@@ -1748,17 +1787,13 @@ def _array_values_preview(array: xr.DataArray, *, level: int = 0) -> tuple[str, 
         values = _edge_values(array)
         # The array is over the threshold, so always summarize the edge values.
         threshold = 0
-    time_formatters = _pandas_time_formatters() if values.dtype.kind in "mM" else None
-    # Commas separate the items, as in the pandas Series preview. The pandas datetime strings
-    # also contain spaces, which a space separator would make ambiguous.
+    # Commas separate the items, as in the pandas Series preview.
     text = _numpy().array2string(
         values,
         threshold=threshold,
         edgeitems=_PREVIEW_EDGEITEMS,
         separator=", ",
-        formatter=None
-        if time_formatters is None
-        else {"datetime": time_formatters[0], "timedelta": time_formatters[1]},
+        formatter={"all": _preview_item_formatter(values.dtype)},
     )
     return _maybe_truncate_string(" ".join(text.split()), level=level)
 
