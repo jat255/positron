@@ -660,6 +660,23 @@ def test_array_view_1d_data_variable_keeps_row_labels(dxf: DataExplorerFixture):
     assert _row_labels(dxf, "distinct", 2) == ["10", "20"]
 
 
+def test_array_view_dataarray_named_after_dim_without_coordinate(dxf: DataExplorerFixture):
+    xr = pytest.importorskip("xarray")
+    dxf.register_table("x", xr.DataArray([1, 2], dims="x", name="x"))
+    schema = dxf.get_schema("x")
+    assert [c["column_name"] for c in schema] == ["x"]
+    assert [c["column_label"] for c in schema] == ["x (x)"]
+    # Like any dim without a coordinate, the rows are labelled with index positions.
+    assert _row_labels(dxf, "x", 2) == ["0", "1"]
+    assert _column_values(dxf, "x", 0, 2) == ["1", "2"]
+
+    # 2-D, with a coordinate on the row dim only
+    da = xr.DataArray(np.zeros((2, 3)), dims=("y", "x"), coords={"y": [5, 6]}, name="x")
+    dxf.register_table("grid", da)
+    assert _row_labels(dxf, "grid", 2) == ["5", "6"]
+    assert [c["column_label"] for c in dxf.get_schema("grid")] == ["x = 0", "x = 1", "x = 2"]
+
+
 #
 # Object columns
 #
