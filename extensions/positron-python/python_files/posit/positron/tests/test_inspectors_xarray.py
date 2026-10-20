@@ -260,7 +260,8 @@ def test_inspect_dask_backed_dataset():
     assert ins.get_display_value() == ("[3 dims x 2 vars] xarray.Dataset (dask)", True)
     assert list(ins.get_children())[-1] == "Dask metadata"
     group = get_inspector(ins.get_child("Dask metadata"))
-    assert group.get_display_value()[0] == "2 chunks, 1.4 KiB (lazy)"  # 12*3*5*4*2 bytes
+    # The count is one variable's chunk grid; the bytes sum all dask variables (12*3*5*4*2).
+    assert group.get_display_value()[0] == "2 chunks per variable, 1.4 KiB (lazy)"
     rows = {
         k: get_inspector(group.get_child(k)).get_display_value()[0] for k in group.get_children()
     }
@@ -327,6 +328,15 @@ def test_inspect_bare_dask_array():
     assert chunks == "(6, 3, 5)"
     layers = get_inspector(group.get_child("graph layers")).get_display_value()[0]
     assert layers == "2"
+
+
+def test_dask_dataset_single_chunk_summary():
+    ds = make_lazy_dataset().chunk({"time": 12})
+    group = get_inspector(get_inspector(ds).get_child("Dask metadata"))
+    assert group.get_display_value()[0] == "1 chunk per variable, 1.4 KiB (lazy)"
+    # A DataArray's count and bytes describe the same array.
+    group = get_inspector(get_inspector(ds["sst"]).get_child("Dask metadata"))
+    assert group.get_display_value()[0] == "1 chunk, 720 B (lazy)"
 
 
 def test_dask_mixed_chunks():

@@ -1492,7 +1492,9 @@ def _dask_metadata(value: Any) -> tuple[str, list[tuple[str, str]]]:
     Describe the chunk layout of a dask-backed value without computing it.
 
     Returns a summary such as "61 chunks, 90.2 MiB (lazy)" and ordered (label, text) rows for
-    `chunks`, `nbytes`, and `graph layers`. `nbytes` sums the dask-backed variables only.
+    `chunks`, `nbytes`, and `graph layers`. `nbytes` sums the dask-backed variables only. For a
+    Dataset the count is one variable's chunk grid, so the summary reads "61 chunks per
+    variable, ...".
     """
     arrays = _dask_variables(value)
     sizes = [_dask_nbytes(array) for _, array in arrays]
@@ -1528,7 +1530,11 @@ def _dask_metadata(value: Any) -> tuple[str, list[tuple[str, str]]]:
     if count is None:
         summary = f"mixed chunks, {nbytes_text} (lazy)"
     else:
-        summary = f"{count} chunk{'' if count == 1 else 's'}, {nbytes_text} (lazy)"
+        xr_mod = sys.modules.get("xarray")
+        per_variable = (
+            " per variable" if xr_mod is not None and isinstance(value, xr_mod.Dataset) else ""
+        )
+        summary = f"{count} chunk{'' if count == 1 else 's'}{per_variable}, {nbytes_text} (lazy)"
     rows: list[tuple[str, str]] = list(
         zip(_DASK_METADATA_LABELS, (chunks_text, nbytes_text, str(layers)))
     )
