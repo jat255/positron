@@ -1409,6 +1409,8 @@ class IbisExprInspector(PositronInspector["ibis.Expr"]):
 
 _NONE_TEXT = "(none)"
 
+XarrayArray = TypeVar("XarrayArray", "xr.DataArray", "xr.Variable")
+
 _BYTE_UNITS = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
 
 
@@ -1446,7 +1448,8 @@ def _dask_variables(value: Any) -> list[tuple[tuple[Hashable, ...] | None, DaskA
     """
     Return `(dims, dask array)` for a dask array or each dask-backed variable of an xarray object.
 
-    Covers a DataArray's data and a Dataset's data variables. Bare dask arrays have no dims.
+    Covers a Variable, a DataArray's data, and a Dataset's data variables. Bare dask arrays have
+    no dims.
     """
     if "dask.array" not in sys.modules:
         return []
@@ -1455,7 +1458,9 @@ def _dask_variables(value: Any) -> list[tuple[tuple[Hashable, ...] | None, DaskA
     xr_mod = sys.modules.get("xarray")
     if xr_mod is None:
         return []
-    if isinstance(value, xr_mod.DataArray):
+    if isinstance(value, xr_mod.Variable):
+        variables = [value]
+    elif isinstance(value, xr_mod.DataArray):
         variables = [value.variable]
     elif isinstance(value, xr_mod.Dataset):
         variables = [value.variables[name] for name in value.data_vars]
@@ -1557,19 +1562,28 @@ def _attrs_equal(a: Mapping[Any, Any], b: Mapping[Any, Any]) -> bool:
         return False
 
 
-# The key of a DataArray's own data in `_xarray_variables`. Any hashable, None included, can name
+# The key of a DataArray's or Variable's own data in `_xarray_variables`. Any hashable, None included, can name
 # an xarray variable, so the key is an object that no user code can pass.
 _OWN_DATA_KEY = object()
 
 
-def _xarray_variables(value: xr.Dataset | xr.DataArray) -> dict[Hashable, xr.Variable]:
-    """Every variable of an xarray object, with a DataArray's own data keyed by `_OWN_DATA_KEY`."""
+def _xarray_variables(
+    value: xr.Dataset | xr.DataArray | xr.Variable,
+) -> dict[Hashable, xr.Variable]:
+    """
+    Every variable of an xarray object.
+
+    A DataArray's own data, and a Variable itself, are keyed by `_OWN_DATA_KEY`.
+    """
     if hasattr(value, "data_vars"):
-        return dict(value.variables)
+        return dict(cast("xr.Dataset", value).variables)
+    if not hasattr(value, "coords"):
+        return {_OWN_DATA_KEY: cast("xr.Variable", value)}
+    array = cast("xr.DataArray", value)
     variables: dict[Hashable, xr.Variable] = {
-        name: coord.variable for name, coord in value.coords.items()
+        name: coord.variable for name, coord in array.coords.items()
     }
-    variables[_OWN_DATA_KEY] = value.variable
+    variables[_OWN_DATA_KEY] = array.variable
     return variables
 
 
@@ -1583,12 +1597,14 @@ def _xarray_lazy_equals(a: Any, b: Any) -> bool:
     """
     if type(a) is not type(b):
         return False
-    if dict(a.sizes) != dict(b.sizes) or list(a.coords) != list(b.coords):
+    # A Variable has no coordinates and no name
+    coords_a = list(getattr(a, "coords", ()))
+    if dict(a.sizes) != dict(b.sizes) or coords_a != list(getattr(b, "coords", ())):
         return False
     if hasattr(a, "data_vars"):
         if list(a.data_vars) != list(b.data_vars):
             return False
-    elif a.name != b.name:
+    elif getattr(a, "name", None) != getattr(b, "name", None):
         return False
     if not _attrs_equal(a.attrs, b.attrs):
         return False
@@ -1692,9 +1708,9 @@ _PREVIEW_THRESHOLD = 100
 _PREVIEW_EDGEITEMS = 3
 
 
-def _edge_values(array: xr.DataArray) -> np.ndarray:
+def _edge_values(array: xr.DataArray | xr.Variable) -> np.ndarray:
     """
-    Read only the leading and trailing items of each dim of a DataArray.
+    Read only the leading and trailing items of each dim of a DataArray or Variable.
 
     Each dim longer than twice the edge items keeps one extra leading item, so that
     `np.array2string` still elides the middle and shows exactly the edge items. A lazily indexed
@@ -1705,7 +1721,7 @@ def _edge_values(array: xr.DataArray) -> np.ndarray:
         [slice(0, edge + 1), slice(size - edge, size)] if size > 2 * edge else [slice(None)]
         for size in array.shape
     ]
-    variable = array.variable
+    variable = getattr(array, "variable", array)
 
     def block(prefix: tuple[slice, ...]) -> Any:
         if len(prefix) == array.ndim:
@@ -1793,8 +1809,8 @@ def _preview_item_formatter(dtype: Any) -> Callable[[Any], str]:
     return format_other
 
 
-def _array_values_preview(array: xr.DataArray, *, level: int = 0) -> tuple[str, bool]:
-    """Preview the values of an eager DataArray, reading only the items the preview shows."""
+def _array_values_preview(array: xr.DataArray | xr.Variable, *, level: int = 0) -> tuple[str, bool]:
+    """Preview an eager DataArray's or Variable's values, reading only the items shown."""
     if array.size <= _PREVIEW_THRESHOLD:
         values = array.to_numpy()
         threshold = _PREVIEW_THRESHOLD
@@ -1982,24 +1998,27 @@ class XarrayDatasetInspector(PositronInspector["xr.Dataset"]):
         return repr(self.value)
 
 
-class XarrayDataArrayInspector(PositronInspector["xr.DataArray"]):
-    CLASS_QNAME = ("xarray.core.dataarray.DataArray", "xarray.DataArray")
+class _XarrayArrayInspector(PositronInspector[XarrayArray], ABC):
+    """Shared behavior of the DataArray and Variable inspectors."""
+
+    def _type_name(self) -> str:
+        return type(self.value).__name__
 
     def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
-        da = self.value
-        if da.ndim == 0:
+        array = self.value
+        if array.ndim == 0:
             shape = "scalar"
         else:
-            shape = " x ".join(f"{dim}: {size}" for dim, size in zip(da.dims, da.shape))
-        text = f"[{shape}] xarray.DataArray"
-        if _is_dask_backed(da):
+            shape = " x ".join(f"{dim}: {size}" for dim, size in zip(array.dims, array.shape))
+        text = f"[{shape}] xarray.{self._type_name()}"
+        if _is_dask_backed(array):
             text += " (dask)"
         return _maybe_truncate_string(text, level=level)[0], True
 
     def get_display_type(self) -> str:
-        da = self.value
-        shape = "x".join(str(size) for size in da.shape) if da.ndim > 0 else "scalar"
-        return f"DataArray [{shape}] {da.dtype}"
+        array = self.value
+        shape = "x".join(str(size) for size in array.shape) if array.ndim > 0 else "scalar"
+        return f"{self._type_name()} [{shape}] {array.dtype}"
 
     def get_kind(self) -> str:
         return "table"
@@ -2015,16 +2034,13 @@ class XarrayDataArrayInspector(PositronInspector["xr.DataArray"]):
     def has_children(self) -> bool:
         return self.get_length() > 0
 
+    @abstractmethod
     def get_children(self) -> list[str]:
-        da = self.value
-        if da.ndim == 0 and len(da.coords) == 0 and len(da.attrs) == 0:
-            return []
-        children: list[str] = []
-        # A coordinate's own DataArray hides the group when it is the only coordinate.
-        # Without coordinates at all, the group stays and shows "(none)".
-        if len(da.coords) == 0 or _coordinate_names(da):
-            children.append(ArrayGroup.COORDINATES)
-        children.append(ArrayGroup.ATTRIBUTES)
+        pass
+
+    def _data_children(self) -> list[str]:
+        """The Attributes, Values, and Dask metadata rows."""
+        children = [ArrayGroup.ATTRIBUTES]
         # A chunked (dask) array has no values preview, since building one would compute.
         if self.value.chunks is None:
             children.append(ArrayGroup.VALUES)
@@ -2045,21 +2061,61 @@ class XarrayDataArrayInspector(PositronInspector["xr.DataArray"]):
             return _eager_variable_nbytes(self.value)
         return self.value.nbytes
 
-    def equals(self, value: xr.DataArray) -> bool:
+    def equals(self, value: XarrayArray) -> bool:
         if _is_dask_backed(self.value) or _is_dask_backed(value):
             return _xarray_lazy_equals(self.value, value)
         return type(value) is type(self.value) and self.value.identical(value)
 
-    def deepcopy(self) -> xr.DataArray:
+    def deepcopy(self) -> XarrayArray:
         if _is_dask_backed(self.value):
             return _xarray_lazy_copy(self.value)
         return self.value.copy(deep=True)
 
+    def to_plaintext(self) -> str:
+        return repr(self.value)
+
+
+class XarrayDataArrayInspector(_XarrayArrayInspector["xr.DataArray"]):
+    CLASS_QNAME = ("xarray.core.dataarray.DataArray", "xarray.DataArray")
+
+    def _type_name(self) -> str:
+        return "DataArray"
+
+    def get_children(self) -> list[str]:
+        da = self.value
+        if da.ndim == 0 and len(da.coords) == 0 and len(da.attrs) == 0:
+            return []
+        children: list[str] = []
+        # A coordinate's own DataArray hides the group when it is the only coordinate.
+        # Without coordinates at all, the group stays and shows "(none)".
+        if len(da.coords) == 0 or _coordinate_names(da):
+            children.append(ArrayGroup.COORDINATES)
+        return children + self._data_children()
+
     def to_html(self) -> str:
         return self.value._repr_html_()
 
-    def to_plaintext(self) -> str:
-        return repr(self.value)
+
+class XarrayVariableInspector(_XarrayArrayInspector["xr.Variable"]):
+    """
+    An xarray Variable, such as an item of `Dataset.variables`.
+
+    A Variable has dims, data, and attrs, without coordinates or a name. The display names the
+    class, Variable or IndexVariable.
+    """
+
+    CLASS_QNAME = (
+        "xarray.core.variable.Variable",
+        "xarray.Variable",
+        "xarray.core.variable.IndexVariable",
+        "xarray.IndexVariable",
+    )
+
+    def get_children(self) -> list[str]:
+        variable = self.value
+        if variable.ndim == 0 and len(variable.attrs) == 0:
+            return []
+        return self._data_children()
 
 
 class DaskArrayInspector(PositronInspector["DaskArray"]):
@@ -2112,6 +2168,7 @@ INSPECTOR_CLASSES: dict[str, type[PositronInspector]] = {
     # xarray inspectors and their child rows
     **dict.fromkeys(XarrayDatasetInspector.CLASS_QNAME, XarrayDatasetInspector),
     **dict.fromkeys(XarrayDataArrayInspector.CLASS_QNAME, XarrayDataArrayInspector),
+    **dict.fromkeys(XarrayVariableInspector.CLASS_QNAME, XarrayVariableInspector),
     **dict.fromkeys(DaskArrayInspector.CLASS_QNAME, DaskArrayInspector),
     get_qualname(MetadataRow): MetadataRowInspector,
     get_qualname(ArrayGroup): ArrayGroupInspector,

@@ -20,6 +20,7 @@ from positron.inspectors import (
     MetadataRowInspector,
     XarrayDataArrayInspector,
     XarrayDatasetInspector,
+    XarrayVariableInspector,
     _format_name_list,
     _format_nbytes,
     _is_dask_backed,
@@ -515,6 +516,7 @@ def test_dask_equals_detects_in_place_edit_of_eager_variable_named_none():
 _ARRAY_INSPECTORS = (
     XarrayDatasetInspector,
     XarrayDataArrayInspector,
+    XarrayVariableInspector,
     DaskArrayInspector,
     ArrayGroupInspector,
     MetadataRowInspector,
@@ -554,6 +556,10 @@ def _assert_lengths_match_children(value: Any, depth: int = 0) -> int:
         pytest.param(lambda: make_dataset()["sst"].mean(), id="0d"),
         pytest.param(lambda: xr.DataArray(3.0), id="0d-bare"),
         pytest.param(lambda: make_lazy_dataset()["sst"].data, id="dask-array"),
+        pytest.param(lambda: make_dataset().variables["sst"], id="variable"),
+        pytest.param(lambda: make_lazy_dataset().variables["sst"], id="dask-variable"),
+        pytest.param(lambda: make_dataset().variables["time"], id="index-variable"),
+        pytest.param(lambda: xr.Variable((), 3.0), id="0d-variable"),
         pytest.param(lambda: MetadataRow("time: 4"), id="metadata-row"),
     ],
 )
@@ -900,3 +906,94 @@ def test_dataarray_named_after_dim_without_coordinate_expands():
     assert list(coords.get_children()) == ["y"]
     assert _assert_lengths_match_children(grid) > 0
     assert _walk(grid) > 3
+
+
+#
+# xarray Variable
+#
+
+
+def test_inspect_xarray_variable():
+    ds = make_dataset()
+    ds["sst"].attrs = {"units": "degC", "long_name": "SST"}
+    variable = ds.variables["sst"]
+    ins = get_inspector(variable)
+    assert type(ins) is XarrayVariableInspector
+    assert ins.get_display_value() == ("[time: 4 x lat: 3 x lon: 5] xarray.Variable", True)
+    assert ins.get_display_type() == "Variable [4x3x5] float32"
+    assert ins.get_kind() == "table"
+    assert ins.get_size() == variable.nbytes
+    assert list(ins.get_children()) == ["Attributes", "Values"]
+    assert ins.get_length() == 2
+    attributes = get_inspector(ins.get_child("Attributes"))
+    assert attributes.get_display_value()[0] == "units, long_name"
+    # The same preview as the DataArray that wraps the Variable
+    values = get_inspector(ins.get_child("Values")).get_display_value()
+    assert values == get_inspector(get_inspector(ds["sst"]).get_child("Values")).get_display_value()
+
+
+def test_inspect_xarray_index_variable():
+    variable = make_dataset().variables["time"]
+    ins = get_inspector(variable)
+    assert type(ins) is XarrayVariableInspector
+    assert ins.get_display_value() == ("[time: 4] xarray.IndexVariable", True)
+    assert ins.get_display_type() == f"IndexVariable [4] {variable.dtype}"
+    values = get_inspector(ins.get_child("Values")).get_display_value()[0]
+    assert values.startswith("[2020-01-01 00:00:00, 2020-01-02 00:00:00")
+
+
+def test_inspect_xarray_variable_0d():
+    ins = get_inspector(xr.Variable((), 3.0))
+    assert ins.get_display_value() == ("[scalar] xarray.Variable", True)
+    assert not ins.has_children()
+    ins = get_inspector(xr.Variable((), 3.0, attrs={"units": "K"}))
+    assert list(ins.get_children()) == ["Attributes", "Values"]
+
+
+def test_variable_values_preview_reads_only_edge_items():
+    shape = (200, 300, 400)
+    da, backend = make_lazily_indexed_dataarray(shape)
+    variable = da.variable
+    preview = get_inspector(get_inspector(variable).get_child("Values")).get_display_value()[0]
+    assert 0 < backend.elements_read <= 7**3
+    assert preview == _full_array_preview(backend.array)
+
+
+def test_xarray_variable_equals_detects_changes():
+    variable = make_dataset().variables["sst"]
+    ins = get_inspector(variable)
+    snapshot = ins.deepcopy()
+    assert ins.equals(snapshot)
+    snapshot.attrs["units"] = "K"
+    assert not ins.equals(snapshot)
+    snapshot = ins.deepcopy()
+    variable[0, 0, 0] = 1
+    assert not get_inspector(snapshot).equals(variable)
+    assert not ins.equals(make_dataset()["sst"])  # type: ignore
+
+
+def test_inspect_dask_variable():
+    variable = make_lazy_dataset().variables["sst"]
+    ins = get_inspector(variable)
+    assert ins.get_display_value() == ("[time: 12 x lat: 3 x lon: 5] xarray.Variable (dask)", True)
+    assert list(ins.get_children()) == ["Attributes", "Dask metadata"]
+    assert ins.get_comparison_cost() == 0
+    group = get_inspector(ins.get_child("Dask metadata"))
+    assert group.get_display_value()[0] == "2 chunks, 720 B (lazy)"
+    chunks = get_inspector(group.get_child("chunks")).get_display_value()[0]
+    assert chunks == "time: 6, lat: 3, lon: 5"
+    # The bomb makes any computation fail the test.
+    assert _walk(variable) > 3
+
+
+def test_dask_variable_equals_detects_changes():
+    variable = make_lazy_dataset().variables["sst"]
+    ins = get_inspector(variable)
+    snapshot = ins.deepcopy()
+    assert ins.equals(snapshot)
+    snapshot.attrs["units"] = "K"
+    assert not ins.equals(snapshot)
+    snapshot = ins.deepcopy()
+    variable[0, 0, 0] = 1
+    assert not get_inspector(snapshot).equals(variable)
+    assert not ins.equals(make_dataset(time=12).variables["sst"])
