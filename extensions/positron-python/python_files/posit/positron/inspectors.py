@@ -2038,6 +2038,11 @@ class _XarrayArrayInspector(PositronInspector[XarrayArray], ABC):
     def get_children(self) -> list[str]:
         pass
 
+    def _is_bare_scalar(self) -> bool:
+        """Whether the array is 0-D, eager, and without attrs: its display says everything."""
+        array = self.value
+        return array.ndim == 0 and len(array.attrs) == 0 and not _is_dask_backed(array)
+
     def _data_children(self) -> list[str]:
         """The Attributes, Values, and Dask metadata rows."""
         children = [ArrayGroup.ATTRIBUTES]
@@ -2083,7 +2088,7 @@ class XarrayDataArrayInspector(_XarrayArrayInspector["xr.DataArray"]):
 
     def get_children(self) -> list[str]:
         da = self.value
-        if da.ndim == 0 and len(da.coords) == 0 and len(da.attrs) == 0:
+        if len(da.coords) == 0 and self._is_bare_scalar():
             return []
         children: list[str] = []
         # A coordinate's own DataArray hides the group when it is the only coordinate.
@@ -2112,8 +2117,7 @@ class XarrayVariableInspector(_XarrayArrayInspector["xr.Variable"]):
     )
 
     def get_children(self) -> list[str]:
-        variable = self.value
-        if variable.ndim == 0 and len(variable.attrs) == 0:
+        if self._is_bare_scalar():
             return []
         return self._data_children()
 

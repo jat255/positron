@@ -997,3 +997,12 @@ def test_dask_variable_equals_detects_changes():
     variable[0, 0, 0] = 1
     assert not get_inspector(snapshot).equals(variable)
     assert not ins.equals(make_dataset(time=12).variables["sst"])
+
+
+def test_dask_backed_0d_arrays_keep_dask_metadata():
+    da_mod = pytest.importorskip("dask.array")
+    ins = get_inspector(xr.Variable((), da_mod.zeros(())))
+    assert list(ins.get_children()) == ["Attributes", "Dask metadata"]
+    # A DataArray without coordinates keeps the group, which shows "(none)"
+    ins = get_inspector(xr.DataArray(da_mod.zeros(())))
+    assert list(ins.get_children()) == ["Coordinates", "Attributes", "Dask metadata"]
