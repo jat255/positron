@@ -329,6 +329,17 @@ describe('TableDataDataGridInstance', () => {
 			expect(instance.cornerTopLeft()).toBeUndefined();
 		});
 
+		it('leaves the corner blank when the backend sends null axis names', async () => {
+			// The Python kernel sends unset optional fields as null.
+			getBackendState.mockResolvedValue(backendState({
+				row_axis_name: null as unknown as undefined,
+				column_axis_name: null as unknown as undefined
+			}));
+			await instance.setVisible(true);
+
+			expect(instance.cornerTopLeft()).toBeUndefined();
+		});
+
 		it('names the axes the backend reports', async () => {
 			getBackendState.mockResolvedValue(backendState({ row_axis_name: 'lat', column_axis_name: 'lon' }));
 			await instance.setVisible(true);

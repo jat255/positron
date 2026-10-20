@@ -441,8 +441,9 @@ export class TableDataCache extends Disposable {
 			this._columns = tableState.table_shape.num_columns;
 			this._rows = tableState.table_shape.num_rows;
 			this._hasRowLabels = tableState.has_row_labels;
-			this._rowAxisName = tableState.row_axis_name;
-			this._columnAxisName = tableState.column_axis_name;
+			// The Python kernel sends an unset axis name as null, so read anything empty as absent.
+			this._rowAxisName = tableState.row_axis_name || undefined;
+			this._columnAxisName = tableState.column_axis_name || undefined;
 
 			// If there are no columns, immediately fire an update and return,
 			// otherwise, continue on to fetch and cache the column schema.

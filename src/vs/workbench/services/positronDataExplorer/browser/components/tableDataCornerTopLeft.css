@@ -6,18 +6,31 @@
 /*
  * Crosstab corner: the column axis name sits at the top right, next to the column headers, and the
  * row axis name at the bottom left, above the row headers.
+ *
+ * In the summary-on-left layout, the summary panel's expand/collapse button sits beside this corner,
+ * so the left padding grows by 12px to keep the row axis name out from under it. That button
+ * (EXPAND_COLLAPSE_BUTTON_SIZE, 25px, in verticalSplitter.tsx) is centered on the splitter, which
+ * is twice the workbench sash size wide, so it reaches into the grid by (25px - splitter width) / 2:
+ * 8.5px at the default sash size and at most 11.5px at the smallest one. No CSS variable exposes
+ * the button size.
  */
 .table-data-corner-top-left {
 	height: 100%;
 	display: grid;
-	padding: 2px 4px;
 	box-sizing: border-box;
+	container-type: inline-size;
 	grid-template-rows: 1fr 1fr;
 	grid-template-columns: minmax(0, 1fr);
+	padding: 3px 4px;
 }
 
+.data-explorer.summary-on-left .right-column .table-data-corner-top-left {
+	padding-left: 16px;
+}
+
+/* The names match the row labels (tableDataRowHeader.css): same size, weight, and color. */
 .table-data-corner-top-left .axis-name {
-	gap: 2px;
+	gap: 3px;
 	min-width: 0;
 	display: flex;
 	max-width: 100%;
@@ -25,7 +38,6 @@
 	font-weight: 600;
 	align-items: center;
 	line-height: normal;
-	color: var(--vscode-descriptionForeground);
 }
 
 .table-data-corner-top-left .column-axis-name {
@@ -46,7 +58,19 @@
 	text-overflow: ellipsis;
 }
 
-.table-data-corner-top-left .axis-name .codicon {
+/*
+ * The arrows are sized to the label text. The selector has to outrank the workbench's 16px codicon
+ * rule (.monaco-workbench .codicon[class*='codicon-'] in workbench/browser/media/style.css).
+ */
+.table-data-corner-top-left .axis-name .codicon[class*='codicon-'] {
 	flex-shrink: 0;
-	font-size: 10px;
+	font-size: 0.9em;
+	line-height: 1;
+}
+
+/* In a narrow row header column, the names keep the room and the arrows go. */
+@container (max-width: 27px) {
+	.table-data-corner-top-left .axis-name .codicon[class*='codicon-'] {
+		display: none;
+	}
 }

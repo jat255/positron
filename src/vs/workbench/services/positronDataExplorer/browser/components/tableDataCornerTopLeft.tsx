@@ -29,14 +29,14 @@ interface TableDataCornerTopLeftProps {
  * @returns The hover text.
  */
 const axisNamesHoverText = (rowAxisName?: string, columnAxisName?: string) => {
-	if (rowAxisName !== undefined && columnAxisName !== undefined) {
+	if (rowAxisName && columnAxisName) {
 		return localize(
 			'positron.dataExplorer.axisNames.rowsAndColumns',
 			"Rows: {0}, Columns: {1}",
 			rowAxisName,
 			columnAxisName
 		);
-	} else if (rowAxisName !== undefined) {
+	} else if (rowAxisName) {
 		return localize('positron.dataExplorer.axisNames.rows', "Rows: {0}", rowAxisName);
 	} else {
 		return localize('positron.dataExplorer.axisNames.columns', "Columns: {0}", columnAxisName);
@@ -73,16 +73,16 @@ export const TableDataCornerTopLeft = (props: TableDataCornerTopLeftProps) => {
 	// Render.
 	return (
 		<div ref={ref} className='table-data-corner-top-left'>
-			{props.columnAxisName !== undefined &&
+			{props.columnAxisName &&
 				<div className='axis-name column-axis-name'>
 					<span className='name'>{props.columnAxisName}</span>
-					<span aria-hidden='true' className='codicon codicon-arrow-right' />
+					<span aria-hidden='true' className='codicon codicon-arrow-right' data-testid='column-axis-arrow' />
 				</div>
 			}
-			{props.rowAxisName !== undefined &&
+			{props.rowAxisName &&
 				<div className='axis-name row-axis-name'>
 					<span className='name'>{props.rowAxisName}</span>
-					<span aria-hidden='true' className='codicon codicon-arrow-down' />
+					<span aria-hidden='true' className='codicon codicon-arrow-down' data-testid='row-axis-arrow' />
 				</div>
 			}
 		</div>

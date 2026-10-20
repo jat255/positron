@@ -414,7 +414,7 @@ export class TableDataDataGridInstance extends DataGridInstance {
 	override cornerTopLeft() {
 		const rowAxisName = this._tableDataCache.rowAxisName;
 		const columnAxisName = this._tableDataCache.columnAxisName;
-		if (rowAxisName === undefined && columnAxisName === undefined) {
+		if (!rowAxisName && !columnAxisName) {
 			return undefined;
 		}
 

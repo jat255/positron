@@ -56,6 +56,20 @@ describe('TableDataCornerTopLeft', () => {
 		await user.hover(screen.getByText('time'));
 
 		expect(hoverManager.showHover).toHaveBeenCalledWith(expect.any(HTMLElement), 'Rows: time');
+		expect(screen.getByTestId('row-axis-arrow')).toBeInTheDocument();
+		expect(screen.queryByTestId('column-axis-arrow')).not.toBeInTheDocument();
+	});
+
+	it('names only the column axis when there is no row axis', async () => {
+		const user = userEvent.setup();
+		const hoverManager = newHoverManager();
+		rtl.render(<TableDataCornerTopLeft columnAxisName='x' hoverManager={hoverManager} />);
+
+		await user.hover(screen.getByText('x'));
+
+		expect(hoverManager.showHover).toHaveBeenCalledWith(expect.any(HTMLElement), 'Columns: x');
+		expect(screen.getByTestId('column-axis-arrow')).toBeInTheDocument();
+		expect(screen.queryByTestId('row-axis-arrow')).not.toBeInTheDocument();
 	});
 });
 
