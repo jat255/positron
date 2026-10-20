@@ -1039,4 +1039,5 @@ def test_inspect_xarray_dataarray_length_is_child_count(
     time = _summarize_variable("time", shell.user_ns["time"])
     assert time is not None
     time_children = _do_inspect([encode_access_key("time")], variables_comm)
+    assert [child.display_name for child in time_children] == ["Attributes", "Values"]
     assert time.length == len(time_children)

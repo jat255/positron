@@ -454,7 +454,7 @@ def test_dask_equals_detects_in_place_edit_of_eager_variable_named_none():
 
 
 #
-# Child counts
+# Child counts and self-referencing coordinates
 #
 
 _ARRAY_INSPECTORS = (
@@ -516,3 +516,43 @@ def test_length_is_child_count_for_groups() -> None:
             assert ins.get_length() == len(list(ins.get_children()))
     assert get_inspector(ArrayGroup("Values", make_dataset()["sst"])).get_length() == 0
     assert get_inspector(ArrayGroup("Dask metadata", ds["sst"].data)).get_length() == 3
+
+
+def test_dimension_coordinate_does_not_list_itself():
+    da = make_dataset()["time"]
+    ins = get_inspector(da)
+    assert list(ins.get_children()) == ["Attributes", "Values"]
+    assert not ins.has_child("Coordinates")
+
+
+def test_scalar_coordinate_does_not_list_itself():
+    da = make_dataset()["sst"].isel(time=0)["time"]
+    assert list(get_inspector(da).get_children()) == ["Attributes", "Values"]
+
+
+def test_slice_keeps_other_coordinates():
+    ins = get_inspector(make_dataset()["sst"].isel(time=0))
+    assert list(ins.get_children()) == ["Coordinates", "Attributes", "Values"]
+    coords = get_inspector(ins.get_child("Coordinates"))
+    assert sorted(coords.get_children()) == ["lat", "lon", "time"]
+    assert coords.get_length() == 3
+
+
+def test_coordinate_with_other_coordinates_omits_itself():
+    ds = make_dataset()
+    ds.coords["doy"] = ("time", np.arange(4))
+    for name, other in (("time", "doy"), ("doy", "time")):
+        ins = get_inspector(ds[name])
+        assert list(ins.get_children()) == ["Coordinates", "Attributes", "Values"]
+        coords = get_inspector(ins.get_child("Coordinates"))
+        assert list(coords.get_children()) == [other]
+        assert coords.get_display_value()[0] == other
+        assert not coords.has_child(name)
+        assert _assert_lengths_match_children(ds[name]) > 0
+
+
+def test_dataarray_without_coordinates_keeps_empty_group():
+    da = xr.DataArray(np.arange(3), dims=("x",), name="x")
+    ins = get_inspector(da)
+    assert list(ins.get_children()) == ["Coordinates", "Attributes", "Values"]
+    assert get_inspector(ins.get_child("Coordinates")).get_display_value()[0] == "(none)"

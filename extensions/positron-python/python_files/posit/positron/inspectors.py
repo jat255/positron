@@ -1714,11 +1714,26 @@ def _array_values_preview(array: xr.DataArray, *, level: int = 0) -> tuple[str, 
     return _maybe_truncate_string(" ".join(text.split()), level=level)
 
 
+def _coordinate_names(owner: xr.Dataset | xr.DataArray) -> list[Hashable]:
+    """
+    The names listed in the Coordinates group of an xarray object.
+
+    The DataArray of a coordinate (for example `ds["time"]`) has itself as a coordinate. Listing it
+    would nest the same row inside itself forever, so a DataArray omits the coordinate that has
+    its own name.
+    """
+    names = list(owner.coords)
+    xr_mod = sys.modules.get("xarray")
+    if xr_mod is not None and isinstance(owner, xr_mod.DataArray) and owner.name in owner.coords:
+        names = [name for name in names if name != owner.name]
+    return names
+
+
 class ArrayGroupInspector(PositronInspector[ArrayGroup]):
     def _names(self) -> list[Any]:
         group = self.value
         if group.name == ArrayGroup.COORDINATES:
-            return list(group.owner.coords)
+            return _coordinate_names(group.owner)
         if group.name == ArrayGroup.DATA_VARIABLES:
             return list(group.owner.data_vars)
         if group.name == ArrayGroup.ATTRIBUTES:
@@ -1887,7 +1902,12 @@ class XarrayDataArrayInspector(PositronInspector["xr.DataArray"]):
         da = self.value
         if da.ndim == 0 and len(da.coords) == 0 and len(da.attrs) == 0:
             return []
-        children = [ArrayGroup.COORDINATES, ArrayGroup.ATTRIBUTES]
+        children: list[str] = []
+        # A coordinate's own DataArray hides the group when it is the only coordinate.
+        # Without coordinates at all, the group stays and shows "(none)".
+        if len(da.coords) == 0 or _coordinate_names(da):
+            children.append(ArrayGroup.COORDINATES)
+        children.append(ArrayGroup.ATTRIBUTES)
         # A chunked (dask) array has no values preview, since building one would compute.
         if self.value.chunks is None:
             children.append(ArrayGroup.VALUES)
