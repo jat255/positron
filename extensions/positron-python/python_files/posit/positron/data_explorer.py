@@ -3130,6 +3130,7 @@ class _ArrayTable:
         name: str | None,
         mask: np.ndarray | None = None,
         label_units: str | None = None,
+        row_axis_name: str | None = None,
     ):
         self.values = values
         # 2-D boolean array, True where a cell is masked (missing), or None
@@ -3142,6 +3143,8 @@ class _ArrayTable:
         self.name = name
         # The `units` attr of the column dim's coordinate (2-D) or of the array itself (1-D)
         self.label_units = label_units
+        # The dim the rows run along, named in the grid corner, or None
+        self.row_axis_name = row_axis_name
 
     def __len__(self) -> int:
         return self.shape[0]
@@ -3157,6 +3160,7 @@ class _ArrayTable:
 
         mask = None
         label_units = None
+        row_axis_name = None
         xr_module = sys.modules.get("xarray")
         if xr_module is not None and isinstance(value, xr_module.Variable):
             # A DataArray without coordinates or a name shows a Variable's dims and attrs. It
@@ -3169,9 +3173,11 @@ class _ArrayTable:
             dims = tuple(str(dim) for dim in value.dims)
             name = None if value.name is None else str(value.name)
             row_dim = value.dims[0]
-            if row_dim not in value.coords or (
-                value.ndim == 1 and _is_own_coordinate(value, row_dim)
-            ):
+            is_own_coordinate = value.ndim == 1 and _is_own_coordinate(value, row_dim)
+            # A DataArray that is its own dim's coordinate already names that dim in its single
+            # column, so the corner leaves the row axis unnamed.
+            row_axis_name = None if is_own_coordinate else str(row_dim)
+            if row_dim not in value.coords or is_own_coordinate:
                 # Without a row coordinate, index positions would repeat the grid's row numbers.
                 # A DataArray that is its own dim's coordinate (for example ds.time) would
                 # repeat each row's value. The grid shows its row numbers in both cases.
@@ -3203,7 +3209,7 @@ class _ArrayTable:
             values = values.reshape(-1, 1)
             if mask is not None:
                 mask = mask.reshape(-1, 1)
-        return cls(values, columns, row_labels, dims, name, mask, label_units)
+        return cls(values, columns, row_labels, dims, name, mask, label_units, row_axis_name)
 
     def column_label(self, column_index: int) -> str | None:
         """
@@ -3487,7 +3493,7 @@ class ArrayView(DataExplorerTableView):
         if dims:
             state.display_name = f"{self.state.name} ({', '.join(dims)})"
             # The grid corner names the dims that index its rows and (for 2-D) its columns.
-            state.row_axis_name = dims[0]
+            state.row_axis_name = self.table.row_axis_name
             if len(dims) > 1:
                 state.column_axis_name = dims[1]
         return state
