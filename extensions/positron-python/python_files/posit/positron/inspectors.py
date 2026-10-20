@@ -1492,10 +1492,16 @@ def _dask_metadata(value: Any) -> tuple[str, list[tuple[str, str]]]:
     Describe the chunk layout of a dask-backed value without computing it.
 
     Returns a summary such as "61 chunks, 90.2 MiB (lazy)" and ordered (label, text) rows for
-    `chunks`, `nbytes`, and `graph layers`. `nbytes` sums the dask-backed variables only. When
-    every dask variable of a Dataset has the same number of chunks, the summary gives that
-    count ("61 chunks per variable, ..."); otherwise it gives the total over the variables, so
-    that the count and the bytes describe the same data.
+    `chunks`, `nbytes`, and `graph layers`. `nbytes` sums the dask-backed variables only.
+
+    The summary's count depends on the chunk layout:
+
+    - Variables that chunk a shared dim differently: no count ("mixed chunks, ..."), and the
+      `chunks` row reads "mixed (varies by variable)".
+    - A Dataset whose dask variables all have the same number of chunks: that count
+      ("61 chunks per variable, ...").
+    - Otherwise: the total over the dask variables ("5 chunks, ..."), so that the count and
+      the bytes describe the same data.
     """
     arrays = _dask_variables(value)
     sizes = [_dask_nbytes(array) for _, array in arrays]
