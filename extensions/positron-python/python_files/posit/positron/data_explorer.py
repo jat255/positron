@@ -3483,8 +3483,13 @@ class ArrayView(DataExplorerTableView):
 
     def get_state(self, _unused):
         state = super().get_state(_unused)
-        if self.table.dims:
-            state.display_name = f"{self.state.name} ({', '.join(self.table.dims)})"
+        dims = self.table.dims
+        if dims:
+            state.display_name = f"{self.state.name} ({', '.join(dims)})"
+            # The grid corner names the dims that index its rows and (for 2-D) its columns.
+            state.row_axis_name = dims[0]
+            if len(dims) > 1:
+                state.column_axis_name = dims[1]
         return state
 
     def get_updated_state(self, new_table) -> StateUpdate:

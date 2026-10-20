@@ -67,6 +67,8 @@ def test_array_view_numpy_2d(dxf: DataExplorerFixture):
     assert (state["table_shape"]["num_rows"], state["table_shape"]["num_columns"]) == (2, 3)
     assert state["display_name"] == "arr"
     assert not state["has_row_labels"]
+    assert state.get("row_axis_name") is None
+    assert state.get("column_axis_name") is None
     schema = dxf.get_schema("arr")
     assert [c["column_name"] for c in schema] == ["0", "1", "2"]
     assert schema[0]["type_display"] == "integer"
@@ -80,6 +82,8 @@ def test_array_view_dataarray_2d(dxf: DataExplorerFixture):
     state = dxf.get_state("sst")
     assert state["display_name"] == "sst (lat, lon)"
     assert state["has_row_labels"]
+    assert state["row_axis_name"] == "lat"
+    assert state["column_axis_name"] == "lon"
     schema = dxf.get_schema("sst")
     assert [c["column_name"] for c in schema] == [str(v) for v in da.lon.to_numpy()]
     assert schema[0]["type_display"] == "floating"
@@ -108,6 +112,8 @@ def test_array_view_1d(dxf: DataExplorerFixture):
     dxf.register_table("lat", lat)
     state = dxf.get_state("lat")
     assert state["display_name"] == "lat (lat)"
+    assert state["row_axis_name"] == "lat"
+    assert state.get("column_axis_name") is None
     assert [c["column_name"] for c in dxf.get_schema("lat")] == ["lat"]
 
 
@@ -172,6 +178,8 @@ def test_array_view_dask_under_limit(dxf: DataExplorerFixture):
     dxf.register_table("lazy", lazy)
     state = dxf.get_state("lazy")
     assert (state["table_shape"]["num_rows"], state["table_shape"]["num_columns"]) == (4, 3)
+    assert state.get("row_axis_name") is None
+    assert state.get("column_axis_name") is None
     assert _column_values(dxf, "lazy", 2, 4) == ["2", "5", "8", "11"]
 
 

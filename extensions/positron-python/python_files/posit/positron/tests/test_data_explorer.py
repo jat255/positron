@@ -674,6 +674,8 @@ def test_pandas_get_state(dxf: DataExplorerFixture):
     assert result["table_unfiltered_shape"] == ex_shape
 
     assert result["has_row_labels"]
+    assert result.get("row_axis_name") is None
+    assert result.get("column_axis_name") is None
 
     schema = dxf.get_schema("simple")
 
