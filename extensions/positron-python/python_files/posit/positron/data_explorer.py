@@ -117,6 +117,7 @@ from .inspectors import (
     _format_name_list,
     _format_nbytes,
     _is_dask_array,
+    _is_own_coordinate,
 )
 from .positron_comm import CommMessage, PositronComm
 from .third_party import is_ibis, is_pandas, is_polars
@@ -3128,6 +3129,7 @@ class _ArrayTable:
         dims: tuple[str, ...],
         name: str | None,
         mask: np.ndarray | None = None,
+        label_units: str | None = None,
     ):
         self.values = values
         # 2-D boolean array, True where a cell is masked (missing), or None
@@ -3138,6 +3140,8 @@ class _ArrayTable:
         self.row_labels = row_labels
         self.dims = dims
         self.name = name
+        # The `units` attr of the column dim's coordinate (2-D) or of the array itself (1-D)
+        self.label_units = label_units
 
     def __len__(self) -> int:
         return self.shape[0]
@@ -3152,6 +3156,7 @@ class _ArrayTable:
         import numpy as np
 
         mask = None
+        label_units = None
         xr_module = sys.modules.get("xarray")
         if xr_module is not None and isinstance(value, xr_module.DataArray):
             # .values computes a dask-backed DataArray
@@ -3159,8 +3164,18 @@ class _ArrayTable:
             dims = tuple(str(dim) for dim in value.dims)
             name = None if value.name is None else str(value.name)
             dim_labels = [cls._dim_labels(value, dim) for dim in value.dims]
-            row_labels = dim_labels[0]
+            row_dim = value.dims[0]
+            if value.ndim == 1 and _is_own_coordinate(value, row_dim):
+                # The DataArray is its own dim's coordinate (for example ds.time), so each row
+                # label would repeat the row's value. The grid shows row numbers instead.
+                row_labels = None
+            else:
+                row_labels = dim_labels[0]
             columns = ["0" if name is None else name] if value.ndim == 1 else dim_labels[1]
+            if value.ndim == 1:
+                label_units = cls._units(value)
+            elif value.dims[1] in value.coords:
+                label_units = cls._units(value.coords[value.dims[1]])
         else:
             if isinstance(value, np.ma.MaskedArray):
                 # np.asarray would drop the mask
@@ -3177,7 +3192,32 @@ class _ArrayTable:
             values = values.reshape(-1, 1)
             if mask is not None:
                 mask = mask.reshape(-1, 1)
-        return cls(values, columns, row_labels, dims, name, mask)
+        return cls(values, columns, row_labels, dims, name, mask, label_units)
+
+    def column_label(self, column_index: int) -> str | None:
+        """
+        The column name tooltip, or None for numpy arrays.
+
+        For a 2-D DataArray it names the column dim and coordinate value, for example
+        "lon = 275.125 degrees_east". For a 1-D DataArray it names the array and its dim, for
+        example "sst (time)". The coordinate's (or 1-D array's) `units` attr follows when set.
+
+        Built from the column names, which already hold the formatted coordinate values (index
+        positions for a dim without a coordinate), so it reads no data.
+        """
+        if not self.dims:
+            return None
+        column = self.columns[column_index]
+        if len(self.dims) == 1:
+            label = f"{column} ({self.dims[0]})"
+        else:
+            label = f"{self.dims[1]} = {column}"
+        return label if self.label_units is None else f"{label} {self.label_units}"
+
+    @staticmethod
+    def _units(data_array: Any) -> str | None:
+        units = data_array.attrs.get("units")
+        return None if units is None or str(units) == "" else str(units)
 
     @staticmethod
     def _dim_labels(data_array: Any, dim: Any) -> list[str]:
@@ -3367,6 +3407,7 @@ class ArrayView(DataExplorerTableView):
     def _get_single_column_schema(self, column_index: int) -> ColumnSchema:
         return ColumnSchema(
             column_name=self._get_column_name(column_index),
+            column_label=self.table.column_label(column_index),
             column_index=column_index,
             type_name=str(self._values.dtype),
             type_display=self._get_column_type_display(column_index),
@@ -3437,8 +3478,8 @@ class ArrayView(DataExplorerTableView):
 
     def get_updated_state(self, new_table) -> StateUpdate:
         # Arrays have no sort keys or filters to carry over. The schema is unchanged when the
-        # shape, dtype, column names, row labels, and dims (which the title names) all match, so
-        # only the data needs a refresh.
+        # shape, dtype, column names, row labels, dims (which the title names), and the units in
+        # the column labels all match, so only the data needs a refresh.
         new_table = _ArrayTable.from_value(new_table)
         old_table = self.table
         schema_updated = (
@@ -3447,6 +3488,7 @@ class ArrayView(DataExplorerTableView):
             or new_table.columns != old_table.columns
             or new_table.row_labels != old_table.row_labels
             or new_table.dims != old_table.dims
+            or new_table.label_units != old_table.label_units
         )
         return schema_updated, DataExplorerState(self.state.name)
 

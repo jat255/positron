@@ -108,7 +108,6 @@ def test_array_view_1d(dxf: DataExplorerFixture):
     state = dxf.get_state("lat")
     assert state["display_name"] == "lat (lat)"
     assert [c["column_name"] for c in dxf.get_schema("lat")] == ["lat"]
-    assert _row_labels(dxf, "lat", 3) == [str(v) for v in lat.to_numpy()]
 
 
 def test_array_view_datetime_1d(dxf: DataExplorerFixture):
@@ -569,6 +568,96 @@ def test_array_view_datetime_labels(dxf: DataExplorerFixture):
     dxf.register_table("cols", da.transpose("lon", "time"))
     columns = [c["column_name"] for c in dxf.get_schema("cols")]
     assert columns[:2] == ["2020-01-01 00:00:00", "2020-01-02 00:00:00"]
+
+
+#
+# Column labels (the column name tooltip) and redundant row labels
+#
+
+
+def _column_labels(dxf: DataExplorerFixture, name: str) -> list[Any]:
+    return [c["column_label"] for c in dxf.get_schema(name)]
+
+
+def test_array_view_column_labels_name_dim_and_coordinate(dxf: DataExplorerFixture):
+    xr = pytest.importorskip("xarray")
+    da = xr.DataArray(
+        np.zeros((2, 2), dtype="float32"),
+        dims=("lat", "lon"),
+        coords={
+            "lat": [10.5, 11.5],
+            "lon": ("lon", [275.125, 275.375], {"units": "degrees_east"}),
+        },
+        name="sst",
+    )
+    dxf.register_table("sst", da)
+    assert _column_labels(dxf, "sst") == [
+        "lon = 275.125 degrees_east",
+        "lon = 275.375 degrees_east",
+    ]
+    # Without units, the label has no trailing units
+    dxf.register_table("flipped", da.transpose("lon", "lat"))
+    assert _column_labels(dxf, "flipped") == ["lat = 10.5", "lat = 11.5"]
+
+
+def test_array_view_column_labels_use_index_without_coordinate(dxf: DataExplorerFixture):
+    xr = pytest.importorskip("xarray")
+    dxf.register_table("z", xr.DataArray(np.zeros((2, 4)), dims=("y", "x"), name="z"))
+    assert _column_labels(dxf, "z") == ["x = 0", "x = 1", "x = 2", "x = 3"]
+
+
+def test_array_view_column_labels_format_datetimes(dxf: DataExplorerFixture):
+    da = make_dataset()["sst"].isel(lat=0).transpose("lon", "time")
+    dxf.register_table("cols", da)
+    labels = _column_labels(dxf, "cols")
+    assert labels[:2] == ["time = 2020-01-01 00:00:00", "time = 2020-01-02 00:00:00"]
+
+
+def test_array_view_column_label_1d(dxf: DataExplorerFixture):
+    xr = pytest.importorskip("xarray")
+    da = make_dataset()["sst"].isel(lat=0, lon=0)
+    dxf.register_table("series", da)
+    assert _column_labels(dxf, "series") == ["sst (time)"]
+    da = da.assign_attrs(units="degC")
+    dxf.register_table("with_units", da)
+    assert _column_labels(dxf, "with_units") == ["sst (time) degC"]
+    dxf.register_table("unnamed", xr.DataArray(np.zeros(2), dims=("x",)))
+    assert _column_labels(dxf, "unnamed") == ["0 (x)"]
+
+
+def test_array_view_numpy_has_no_column_labels(dxf: DataExplorerFixture):
+    dxf.register_table("arr", np.zeros((2, 3)))
+    assert _column_labels(dxf, "arr") == [None, None, None]
+    dxf.register_table("vec", np.zeros(3))
+    assert _column_labels(dxf, "vec") == [None]
+
+
+def test_array_view_column_labels_of_lazily_indexed_array(dxf: DataExplorerFixture):
+    values = np.arange(6.0).reshape(2, 3)
+    da = _lazily_indexed_dataarray((2, 3), values.dtype, values)
+    da = da.assign_coords(x=("x", [1, 2, 3], {"units": "m"}))
+    dxf.register_table("lazy", da)
+    assert _column_labels(dxf, "lazy") == ["x = 1 m", "x = 2 m", "x = 3 m"]
+
+
+def test_array_view_own_coordinate_has_no_row_labels(dxf: DataExplorerFixture):
+    ds = make_dataset()
+    for name in ("time", "lat"):
+        dxf.register_table(name, ds[name])
+        assert not dxf.get_state(name)["has_row_labels"]
+
+
+def test_array_view_1d_data_variable_keeps_row_labels(dxf: DataExplorerFixture):
+    da = make_dataset()["sst"].isel(lat=0, lon=0)  # indexed by time
+    dxf.register_table("series", da)
+    assert dxf.get_state("series")["has_row_labels"]
+    assert _row_labels(dxf, "series", 2) == ["2020-01-01 00:00:00", "2020-01-02 00:00:00"]
+    # A same-named coordinate that is not the DataArray itself still labels the rows
+    xr = pytest.importorskip("xarray")
+    distinct = xr.DataArray([1, 2], dims="x", coords={"x": [10, 20]}, name="x")
+    dxf.register_table("distinct", distinct)
+    assert dxf.get_state("distinct")["has_row_labels"]
+    assert _row_labels(dxf, "distinct", 2) == ["10", "20"]
 
 
 #
