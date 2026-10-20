@@ -93,7 +93,8 @@ def test_array_view_dataarray_2d_without_coordinates(dxf: DataExplorerFixture):
     da = xr.DataArray(np.zeros((2, 3)), dims=("y", "x"), name="z")
     dxf.register_table("z", da)
     assert [c["column_name"] for c in dxf.get_schema("z")] == ["0", "1", "2"]
-    assert _row_labels(dxf, "z", 2) == ["0", "1"]
+    # Without a row coordinate the grid shows its own row numbers.
+    assert not dxf.get_state("z")["has_row_labels"]
 
 
 def test_array_view_1d(dxf: DataExplorerFixture):
@@ -666,8 +667,8 @@ def test_array_view_dataarray_named_after_dim_without_coordinate(dxf: DataExplor
     schema = dxf.get_schema("x")
     assert [c["column_name"] for c in schema] == ["x"]
     assert [c["column_label"] for c in schema] == ["x (x)"]
-    # Like any dim without a coordinate, the rows are labelled with index positions.
-    assert _row_labels(dxf, "x", 2) == ["0", "1"]
+    # Without a coordinate the grid shows its own row numbers.
+    assert not dxf.get_state("x")["has_row_labels"]
     assert _column_values(dxf, "x", 0, 2) == ["1", "2"]
 
     # 2-D, with a coordinate on the row dim only
@@ -675,6 +676,25 @@ def test_array_view_dataarray_named_after_dim_without_coordinate(dxf: DataExplor
     dxf.register_table("grid", da)
     assert _row_labels(dxf, "grid", 2) == ["5", "6"]
     assert [c["column_label"] for c in dxf.get_schema("grid")] == ["x = 0", "x = 1", "x = 2"]
+
+
+def test_array_view_row_dim_without_coordinate_has_no_row_labels(dxf: DataExplorerFixture):
+    xr = pytest.importorskip("xarray")
+    dxf.register_table("vec", xr.DataArray(np.arange(3.0), dims=("x",), name="v"))
+    assert not dxf.get_state("vec")["has_row_labels"]
+
+    # 2-D: a coordinate on the column dim only. Columns keep coordinate names and labels.
+    da = xr.DataArray(np.zeros((2, 3)), dims=("y", "x"), coords={"x": [7, 8, 9]}, name="z")
+    dxf.register_table("cols", da)
+    assert not dxf.get_state("cols")["has_row_labels"]
+    schema = dxf.get_schema("cols")
+    assert [c["column_name"] for c in schema] == ["7", "8", "9"]
+    assert [c["column_label"] for c in schema] == ["x = 7", "x = 8", "x = 9"]
+
+    # 2-D without any coordinate: columns are named by index and keep the tooltip.
+    dxf.register_table("bare", xr.DataArray(np.zeros((2, 2)), dims=("y", "x")))
+    assert not dxf.get_state("bare")["has_row_labels"]
+    assert [c["column_label"] for c in dxf.get_schema("bare")] == ["x = 0", "x = 1"]
 
 
 #

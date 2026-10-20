@@ -3163,15 +3163,21 @@ class _ArrayTable:
             values = np.asarray(value.values)
             dims = tuple(str(dim) for dim in value.dims)
             name = None if value.name is None else str(value.name)
-            dim_labels = [cls._dim_labels(value, dim) for dim in value.dims]
             row_dim = value.dims[0]
-            if value.ndim == 1 and _is_own_coordinate(value, row_dim):
-                # The DataArray is its own dim's coordinate (for example ds.time), so each row
-                # label would repeat the row's value. The grid shows row numbers instead.
+            if row_dim not in value.coords or (
+                value.ndim == 1 and _is_own_coordinate(value, row_dim)
+            ):
+                # Without a row coordinate, index positions would repeat the grid's row numbers.
+                # A DataArray that is its own dim's coordinate (for example ds.time) would
+                # repeat each row's value. The grid shows its row numbers in both cases.
                 row_labels = None
             else:
-                row_labels = dim_labels[0]
-            columns = ["0" if name is None else name] if value.ndim == 1 else dim_labels[1]
+                row_labels = cls._dim_labels(value, row_dim)
+            if value.ndim == 1:
+                columns = ["0" if name is None else name]
+            else:
+                # Columns need names, so a dim without a coordinate uses index positions.
+                columns = cls._dim_labels(value, value.dims[1])
             if value.ndim == 1:
                 label_units = cls._units(value)
             elif value.dims[1] in value.coords:
