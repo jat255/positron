@@ -3724,6 +3724,15 @@ export abstract class DataGridInstance extends Disposable {
 	}
 
 	/**
+	 * Gets the content of the top-left corner cell, above the row headers and left of the column
+	 * headers.
+	 * @returns The corner content, or, undefined to leave the corner blank.
+	 */
+	cornerTopLeft(): JSX.Element | undefined {
+		return undefined;
+	}
+
+	/**
 	 * Gets a data cell.
 	 * @param columnIndex The column index.
 	 * @param rowIndex The row index.

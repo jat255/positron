@@ -16,6 +16,7 @@ import { IColumnSortKey } from '../../../browser/positronDataGrid/interfaces/col
 import { TableDataCell } from './components/tableDataCell.js';
 import { AnchorPoint } from '../../../browser/positronComponents/positronModalPopup/positronModalPopup.js';
 import { TableDataRowHeader } from './components/tableDataRowHeader.js';
+import { TableDataCornerTopLeft } from './components/tableDataCornerTopLeft.js';
 import { TableDataCellPlaceholder } from './components/tableDataCellPlaceholder.js';
 import { CustomContextMenuItem } from '../../../browser/positronComponents/customContextMenu/customContextMenuItem.js';
 import { PositronDataExplorerColumn } from './positronDataExplorerColumn.js';
@@ -406,11 +407,26 @@ export class TableDataDataGridInstance extends DataGridInstance {
 	}
 
 	/**
-	 * Gets a data cell.
-	 * @param columnIndex The column index.
-	 * @param rowIndex The row index.
-	 * @returns The cell value.
+	 * Gets the top-left corner content, which names the dimensions the rows and columns are indexed
+	 * by when the backend reports them (e.g. an xarray DataArray).
+	 * @returns The corner content, or, undefined when the backend names no axes.
 	 */
+	override cornerTopLeft() {
+		const rowAxisName = this._tableDataCache.rowAxisName;
+		const columnAxisName = this._tableDataCache.columnAxisName;
+		if (rowAxisName === undefined && columnAxisName === undefined) {
+			return undefined;
+		}
+
+		return (
+			<TableDataCornerTopLeft
+				columnAxisName={columnAxisName}
+				hoverManager={this._hoverManager}
+				rowAxisName={rowAxisName}
+			/>
+		);
+	}
+
 	/**
 	 * Override base class to provide hover manager.
 	 */

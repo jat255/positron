@@ -1,0 +1,52 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (C) 2026 Posit Software, PBC. All rights reserved.
+ *  Licensed under the Elastic License 2.0. See LICENSE.txt for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/*
+ * Crosstab corner: the column axis name sits at the top right, next to the column headers, and the
+ * row axis name at the bottom left, above the row headers.
+ */
+.table-data-corner-top-left {
+	height: 100%;
+	display: grid;
+	padding: 2px 4px;
+	box-sizing: border-box;
+	grid-template-rows: 1fr 1fr;
+	grid-template-columns: minmax(0, 1fr);
+}
+
+.table-data-corner-top-left .axis-name {
+	gap: 2px;
+	min-width: 0;
+	display: flex;
+	max-width: 100%;
+	font-size: 75%;
+	font-weight: 600;
+	align-items: center;
+	line-height: normal;
+	color: var(--vscode-descriptionForeground);
+}
+
+.table-data-corner-top-left .column-axis-name {
+	grid-row: 1;
+	align-self: start;
+	justify-self: end;
+}
+
+.table-data-corner-top-left .row-axis-name {
+	grid-row: 2;
+	align-self: end;
+	justify-self: start;
+}
+
+.table-data-corner-top-left .axis-name .name {
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+
+.table-data-corner-top-left .axis-name .codicon {
+	flex-shrink: 0;
+	font-size: 10px;
+}

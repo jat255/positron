@@ -154,6 +154,16 @@ export class TableDataCache extends Disposable {
 	private _hasRowLabels: boolean | undefined;
 
 	/**
+	 * The name of the dimension the rows are indexed by, or undefined when the backend names none.
+	 */
+	private _rowAxisName: string | undefined;
+
+	/**
+	 * The name of the dimension the columns are indexed by, or undefined when the backend names none.
+	 */
+	private _columnAxisName: string | undefined;
+
+	/**
 	 * Whether the last attempt to load cell values came back with nothing to show for it. Cells the
 	 * grid asked for are then uncached with nothing on the way, which reads the same as one still
 	 * loading unless the grid is told the difference -- so this is what stops it from marking them
@@ -250,6 +260,22 @@ export class TableDataCache extends Disposable {
 	 */
 	get rowLabelsLoadFailed() {
 		return this._rowLabelsLoadFailed;
+	}
+
+	/**
+	 * Gets the name of the dimension the rows are indexed by (e.g. an xarray dimension name), or
+	 * undefined when the backend names none.
+	 */
+	get rowAxisName() {
+		return this._rowAxisName;
+	}
+
+	/**
+	 * Gets the name of the dimension the columns are indexed by, or undefined when the backend
+	 * names none.
+	 */
+	get columnAxisName() {
+		return this._columnAxisName;
 	}
 
 	//#endregion Public Properties
@@ -410,11 +436,13 @@ export class TableDataCache extends Disposable {
 		// https://github.com/posit-dev/positron/issues/12547.
 		this._updating = true;
 		try {
-			// Get the size of the data and whether it has row labels.
+			// Get the size of the data, whether it has row labels, and the names of its axes.
 			const tableState = await this._dataExplorerClientInstance.getBackendState();
 			this._columns = tableState.table_shape.num_columns;
 			this._rows = tableState.table_shape.num_rows;
 			this._hasRowLabels = tableState.has_row_labels;
+			this._rowAxisName = tableState.row_axis_name;
+			this._columnAxisName = tableState.column_axis_name;
 
 			// If there are no columns, immediately fire an update and return,
 			// otherwise, continue on to fetch and cache the column schema.
