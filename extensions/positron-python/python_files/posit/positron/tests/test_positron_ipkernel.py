@@ -263,6 +263,19 @@ def test_view_array_over_size_limit_explains(shell: PositronShell, capsys) -> No
     )
 
 
+def test_view_lazy_object_array_explains(shell: PositronShell, capsys) -> None:
+    np = pytest.importorskip("numpy")
+    from .utils import make_compute_bomb
+
+    # The bomb makes any computation fail the test.
+    shell.user_ns["lazy"] = make_compute_bomb(np.array(["x" * 1000] * 4, dtype=object), chunks=2)
+    shell.run_cell("%view lazy")
+    assert capsys.readouterr().err == (
+        "UsageError: lazy has object dtype and is not in memory, so the memory it needs is not "
+        "known until it is loaded. Call .compute() first.\n"
+    )
+
+
 def assert_register_connection_called(mock_connections_service: Mock, obj: Any) -> None:
     call_args_list = mock_connections_service.register_connection.call_args_list
     assert len(call_args_list) == 1

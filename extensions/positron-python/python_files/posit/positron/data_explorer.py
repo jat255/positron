@@ -2978,6 +2978,16 @@ def _array_lazy_nbytes(value: Any) -> int | None:
     return int(value.nbytes)
 
 
+def _is_lazy_object_array(value: Any, nbytes: int | None) -> bool:
+    """
+    Whether value is an object-dtype array that is not in memory, given its lazy nbytes.
+
+    The itemsize of an object dtype counts only pointers, so nbytes cannot bound the memory that
+    loading the objects (for example long strings) needs.
+    """
+    return value.dtype.kind == "O" and nbytes != 0
+
+
 def _is_viewable_array(value: Any) -> bool:
     """Whether value is a 1-D or 2-D numpy array, xarray DataArray, or dask array to view."""
     if not _is_array(value) or value.ndim not in (1, 2):
@@ -2986,7 +2996,9 @@ def _is_viewable_array(value: Any) -> bool:
         # Structured dtypes have no single column type
         return False
     nbytes = _array_lazy_nbytes(value)
-    return nbytes is not None and nbytes <= ARRAY_VIEW_MAX_LAZY_BYTES
+    if nbytes is None or _is_lazy_object_array(value, nbytes):
+        return False
+    return nbytes <= ARRAY_VIEW_MAX_LAZY_BYTES
 
 
 def _array_view_unavailable_message(value: Any, expr: str) -> str | None:
@@ -3028,6 +3040,11 @@ def _array_view_unavailable_message(value: Any, expr: str) -> str | None:
         if nbytes is None:
             return (
                 f"{expr} has a shape that is not known until it is computed. Call .compute() first."
+            )
+        if _is_lazy_object_array(value, nbytes):
+            return (
+                f"{expr} has object dtype and is not in memory, so the memory it needs is not "
+                "known until it is loaded. Call .compute() first."
             )
         if nbytes > ARRAY_VIEW_MAX_LAZY_BYTES:
             return (

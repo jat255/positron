@@ -341,6 +341,39 @@ def test_lazily_indexed_dataarray_under_limit_opens(dxf: DataExplorerFixture):
     assert _column_values(dxf, "lazy", 1, 2) == ["1.00", "4.00"]
 
 
+def _lazy_object_arrays() -> list[Any]:
+    """Lazy object-dtype arrays, whose itemsize counts pointers, not the objects they load."""
+    xr = pytest.importorskip("xarray")
+    from .utils import make_compute_bomb
+
+    # The bomb makes any computation fail the test.
+    bomb = make_compute_bomb(np.array(["x" * 1000] * 4, dtype=object), chunks=2)
+    return [
+        bomb,
+        xr.DataArray(bomb, dims=("x",), name="lazy"),
+        _lazily_indexed_dataarray((2, 3), object),
+    ]
+
+
+def test_lazy_object_arrays_are_not_viewable():
+    for value in _lazy_object_arrays():
+        assert not _value_type_is_supported(value)
+        assert not get_inspector(value).has_viewer()
+        assert _array_view_unavailable_message(value, "lazy") == (
+            "lazy has object dtype and is not in memory, so the memory it needs is not known "
+            "until it is loaded. Call .compute() first."
+        )
+
+
+def test_in_memory_object_arrays_stay_viewable():
+    xr = pytest.importorskip("xarray")
+    values = np.array(["a", None, 3], dtype=object)
+    for value in (values, xr.DataArray(values, dims=("x",), name="obj")):
+        assert _value_type_is_supported(value)
+        assert get_inspector(value).has_viewer()
+        assert _array_view_unavailable_message(value, "obj") is None
+
+
 #
 # Variable updates of an open array explorer
 #
