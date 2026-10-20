@@ -1770,8 +1770,15 @@ def _is_own_coordinate(array: xr.DataArray, name: Hashable) -> bool:
     The DataArray of a coordinate (for example `ds["time"]`) has itself as a coordinate, and
     xarray gives both the same Variable object. A distinct coordinate can share the DataArray's
     name, or even its data, but never its Variable. Nothing is read or computed.
+
+    A dim without a coordinate is not in `array.coords`. Looking it up anyway raises on some
+    xarray versions and builds a default range coordinate of the dim's length on others.
     """
-    return name == array.name and array.coords[name].variable is array.variable
+    return (
+        name == array.name
+        and name in array.coords
+        and array.coords[name].variable is array.variable
+    )
 
 
 def _coordinate_names(owner: xr.Dataset | xr.DataArray) -> list[Hashable]:

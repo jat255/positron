@@ -23,6 +23,7 @@ from positron.inspectors import (
     _format_name_list,
     _format_nbytes,
     _is_dask_backed,
+    _is_own_coordinate,
     get_inspector,
 )
 
@@ -755,3 +756,37 @@ def test_values_preview_uses_commas_for_every_dtype(values: np.ndarray):
 def test_values_preview_0d():
     da = xr.DataArray(np.float64(2.5))
     assert get_inspector(ArrayGroup("Values", da)).get_display_value()[0] == "2.5"
+
+
+#
+# A DataArray named after a dim that has no coordinate
+#
+
+
+def test_is_own_coordinate_without_coordinate(monkeypatch: pytest.MonkeyPatch):
+    da = xr.DataArray([1, 2], dims="x", name="x")
+    # Some xarray versions raise for a dim without a coordinate; others build a default
+    # range coordinate, which allocates the dim's length. The helper looks up neither.
+    coords_type = type(da.coords)
+
+    def fail(*_args: Any) -> Any:
+        raise KeyError("x")
+
+    monkeypatch.setattr(coords_type, "__getitem__", fail)
+    assert not _is_own_coordinate(da, "x")
+
+
+def test_dataarray_named_after_dim_without_coordinate_expands():
+    da = xr.DataArray([1, 2], dims="x", name="x")
+    ins = get_inspector(da)
+    assert list(ins.get_children()) == ["Coordinates", "Attributes", "Values"]
+    assert get_inspector(ins.get_child("Coordinates")).get_display_value()[0] == "(none)"
+    assert _assert_lengths_match_children(da) > 0
+    assert _walk(da) > 3
+
+    # 2-D, with a coordinate on one dim only
+    grid = xr.DataArray(np.zeros((2, 3)), dims=("y", "x"), coords={"y": [5, 6]}, name="x")
+    coords = get_inspector(get_inspector(grid).get_child("Coordinates"))
+    assert list(coords.get_children()) == ["y"]
+    assert _assert_lengths_match_children(grid) > 0
+    assert _walk(grid) > 3
