@@ -1492,33 +1492,33 @@ def _dask_metadata(value: Any) -> tuple[str, list[tuple[str, str]]]:
     Describe the chunk layout of a dask-backed value without computing it.
 
     Returns a summary such as "61 chunks, 90.2 MiB (lazy)" and ordered (label, text) rows for
-    `chunks`, `nbytes`, and `graph layers`. `nbytes` sums the dask-backed variables only. For a
-    Dataset the count is one variable's chunk grid, so the summary reads "61 chunks per
-    variable, ...".
+    `chunks`, `nbytes`, and `graph layers`. `nbytes` sums the dask-backed variables only. When
+    every dask variable of a Dataset has the same number of chunks, the summary gives that
+    count ("61 chunks per variable, ..."); otherwise it gives the total over the variables, so
+    that the count and the bytes describe the same data.
     """
     arrays = _dask_variables(value)
     sizes = [_dask_nbytes(array) for _, array in arrays]
     nbytes_text = "unknown" if None in sizes else _format_nbytes(sum(cast("list[int]", sizes)))
 
-    count: int | None
+    # `numblocks` is each array's chunk grid, read from metadata.
+    counts = [math.prod(array.numblocks) for _, array in arrays]
+    mixed = False
     if len(arrays) == 1 and arrays[0][0] is None:
         array = arrays[0][1]
         chunks_text = str(tuple(_first_chunk(c) for c in array.chunks))
-        count = math.prod(len(c) for c in array.chunks)
     else:
         grid: dict[Hashable, tuple[int, ...]] = {}
-        mixed = False
         for dims, array in arrays:
             for dim, chunks in zip(dims or (), array.chunks):
                 if grid.setdefault(dim, chunks) != chunks:
                     mixed = True
         if mixed:
             chunks_text = "mixed (varies by variable)"
-            count = None
         else:
+            # Without conflicts, each dim has one chunk size across the variables that use it.
             dims = [dim for dim in value.sizes if dim in grid]
             chunks_text = ", ".join(f"{dim}: {_first_chunk(grid[dim])}" for dim in dims)
-            count = math.prod(len(grid[dim]) for dim in dims)
 
     graph = value.__dask_graph__()
     hlg_mod = sys.modules.get("dask.highlevelgraph")
@@ -1527,14 +1527,16 @@ def _dask_metadata(value: Any) -> tuple[str, list[tuple[str, str]]]:
     else:
         layers = 1
 
-    if count is None:
+    xr_mod = sys.modules.get("xarray")
+    is_dataset = xr_mod is not None and isinstance(value, xr_mod.Dataset)
+    if mixed:
         summary = f"mixed chunks, {nbytes_text} (lazy)"
+    elif is_dataset and len(set(counts)) == 1:
+        count = counts[0]
+        summary = f"{count} chunk{'' if count == 1 else 's'} per variable, {nbytes_text} (lazy)"
     else:
-        xr_mod = sys.modules.get("xarray")
-        per_variable = (
-            " per variable" if xr_mod is not None and isinstance(value, xr_mod.Dataset) else ""
-        )
-        summary = f"{count} chunk{'' if count == 1 else 's'}{per_variable}, {nbytes_text} (lazy)"
+        count = sum(counts)
+        summary = f"{count} chunk{'' if count == 1 else 's'}, {nbytes_text} (lazy)"
     rows: list[tuple[str, str]] = list(
         zip(_DASK_METADATA_LABELS, (chunks_text, nbytes_text, str(layers)))
     )

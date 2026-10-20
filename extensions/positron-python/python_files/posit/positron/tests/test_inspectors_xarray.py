@@ -339,6 +339,38 @@ def test_dask_dataset_single_chunk_summary():
     assert group.get_display_value()[0] == "1 chunk, 720 B (lazy)"
 
 
+def test_dask_dataset_different_chunk_counts_summary():
+    from .utils import make_compute_bomb
+
+    # The bombs make any computation fail the test.
+    ds = xr.Dataset(
+        {
+            "a": (("x",), make_compute_bomb(np.zeros(4), chunks=2)),
+            "b": (("y",), make_compute_bomb(np.zeros(3), chunks=1)),
+        }
+    )
+    group = get_inspector(get_inspector(ds).get_child("Dask metadata"))
+    # 2 + 3 chunks over 4*8 + 3*8 bytes: the total count and the total size describe the same data.
+    assert group.get_display_value()[0] == "5 chunks, 56 B (lazy)"
+    chunks = get_inspector(group.get_child("chunks")).get_display_value()[0]
+    assert chunks == "x: 2, y: 1"
+
+
+def test_dask_dataset_oisst_like_summary():
+    from .utils import make_compute_bomb
+
+    shape = (366, 4, 5)
+    bomb = make_compute_bomb(np.zeros(shape, dtype="float32"), chunks=(6, 4, 5))
+    ds = xr.Dataset(
+        {
+            "sst": (("time", "lat", "lon"), bomb),
+            "anom": (("time", "lat", "lon"), bomb + 1),
+        }
+    )
+    group = get_inspector(get_inspector(ds).get_child("Dask metadata"))
+    assert group.get_display_value()[0].startswith("61 chunks per variable, ")
+
+
 def test_dask_mixed_chunks():
     ds = make_lazy_dataset()
     ds["anom"] = ds["anom"].chunk({"time": 4})
