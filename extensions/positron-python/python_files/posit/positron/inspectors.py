@@ -1735,17 +1735,17 @@ def _array_values_preview(array: xr.DataArray, *, level: int = 0) -> tuple[str, 
         # The array is over the threshold, so always summarize the edge values.
         threshold = 0
     time_formatters = _pandas_time_formatters() if values.dtype.kind in "mM" else None
-    if time_formatters is None:
-        text = _numpy().array2string(values, threshold=threshold, edgeitems=_PREVIEW_EDGEITEMS)
-    else:
-        # The pandas strings contain spaces, so commas separate the items.
-        text = _numpy().array2string(
-            values,
-            threshold=threshold,
-            edgeitems=_PREVIEW_EDGEITEMS,
-            separator=", ",
-            formatter={"datetime": time_formatters[0], "timedelta": time_formatters[1]},
-        )
+    # Commas separate the items, as in the pandas Series preview. The pandas datetime strings
+    # also contain spaces, which a space separator would make ambiguous.
+    text = _numpy().array2string(
+        values,
+        threshold=threshold,
+        edgeitems=_PREVIEW_EDGEITEMS,
+        separator=", ",
+        formatter=None
+        if time_formatters is None
+        else {"datetime": time_formatters[0], "timedelta": time_formatters[1]},
+    )
     return _maybe_truncate_string(" ".join(text.split()), level=level)
 
 
