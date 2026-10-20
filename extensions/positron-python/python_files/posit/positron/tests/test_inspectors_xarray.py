@@ -556,3 +556,58 @@ def test_dataarray_without_coordinates_keeps_empty_group():
     ins = get_inspector(da)
     assert list(ins.get_children()) == ["Coordinates", "Attributes", "Values"]
     assert get_inspector(ins.get_child("Coordinates")).get_display_value()[0] == "(none)"
+
+
+#
+# Datetime values preview
+#
+
+
+def _values_preview(da: xr.DataArray) -> str:
+    return get_inspector(get_inspector(da).get_child("Values")).get_display_value()[0]
+
+
+def test_values_preview_datetime_uses_pandas_style():
+    preview = _values_preview(make_dataset()["time"])
+    assert preview == (
+        "[2020-01-01 00:00:00, 2020-01-02 00:00:00, 2020-01-03 00:00:00, 2020-01-04 00:00:00]"
+    )
+    assert "T00:00:00.000000000" not in preview
+    assert "'" not in preview
+
+
+def test_values_preview_datetime_summarizes_long_arrays():
+    preview = _values_preview(make_dataset(time=366)["time"])
+    assert preview == (
+        "[2020-01-01 00:00:00, 2020-01-02 00:00:00, 2020-01-03 00:00:00, ...,"
+        " 2020-12-29 00:00:00, 2020-12-30 00:00:00, 2020-12-31 00:00:00]"
+    )
+
+
+def test_values_preview_datetime_nat_and_timedelta():
+    times = np.array(["2020-01-01T06:30", "NaT"], dtype="datetime64[ns]")
+    assert _values_preview(xr.DataArray(times, dims=("t",))) == "[2020-01-01 06:30:00, NaT]"
+    deltas = np.array([1, 2], dtype="timedelta64[D]").astype("timedelta64[ns]")
+    preview = _values_preview(xr.DataArray(deltas, dims=("t",)))
+    assert preview == "[1 days 00:00:00, 2 days 00:00:00]"
+
+
+def test_values_preview_datetime_without_pandas(monkeypatch: pytest.MonkeyPatch):
+    import sys
+
+    da = make_dataset()["time"]
+    monkeypatch.setitem(sys.modules, "pandas", None)  # type: ignore
+    preview = _values_preview(da)
+    assert preview == " ".join(np.array2string(da.to_numpy(), threshold=100, edgeitems=3).split())
+
+
+def test_values_preview_datetime_reads_only_edge_items():
+    from xarray.core import indexing
+
+    times = np.arange("2020-01-01", "2021-01-01", dtype="datetime64[D]").astype("datetime64[ns]")
+    backend = _CountingBackendArray(times)
+    da = xr.DataArray(xr.Variable(("time",), indexing.LazilyIndexedArray(backend)))
+    preview = _values_preview(da)
+    assert backend.elements_read <= 7
+    assert preview.startswith("[2020-01-01 00:00:00, ")
+    assert preview.endswith(" 2020-12-31 00:00:00]")

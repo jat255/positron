@@ -1701,6 +1701,30 @@ def _edge_values(array: xr.DataArray) -> np.ndarray:
     return _numpy().block(block(()))
 
 
+def _pandas_time_formatters() -> tuple[Callable[[Any], str], Callable[[Any], str]] | None:
+    """
+    Format functions that show datetime64 and timedelta64 items as pandas does.
+
+    numpy shows them as quoted ISO strings with nanoseconds (`'2020-01-01T00:00:00.000000000'`).
+    Returns None when pandas has not been imported, so that numpy's own format applies.
+    """
+    pd_mod = sys.modules.get("pandas")
+    if pd_mod is None:
+        return None
+
+    def format_with(convert: Callable[[Any], Any]) -> Callable[[Any], str]:
+        def format_item(item: Any) -> str:
+            try:
+                return str(convert(item))
+            except (ValueError, OverflowError):
+                # For example, a date outside the range of pandas' nanosecond timestamps.
+                return str(item)
+
+        return format_item
+
+    return format_with(pd_mod.Timestamp), format_with(pd_mod.Timedelta)
+
+
 def _array_values_preview(array: xr.DataArray, *, level: int = 0) -> tuple[str, bool]:
     """Preview the values of an eager DataArray, reading only the items the preview shows."""
     if array.size <= _PREVIEW_THRESHOLD:
@@ -1710,7 +1734,18 @@ def _array_values_preview(array: xr.DataArray, *, level: int = 0) -> tuple[str, 
         values = _edge_values(array)
         # The array is over the threshold, so always summarize the edge values.
         threshold = 0
-    text = _numpy().array2string(values, threshold=threshold, edgeitems=_PREVIEW_EDGEITEMS)
+    time_formatters = _pandas_time_formatters() if values.dtype.kind in "mM" else None
+    if time_formatters is None:
+        text = _numpy().array2string(values, threshold=threshold, edgeitems=_PREVIEW_EDGEITEMS)
+    else:
+        # The pandas strings contain spaces, so commas separate the items.
+        text = _numpy().array2string(
+            values,
+            threshold=threshold,
+            edgeitems=_PREVIEW_EDGEITEMS,
+            separator=", ",
+            formatter={"datetime": time_formatters[0], "timedelta": time_formatters[1]},
+        )
     return _maybe_truncate_string(" ".join(text.split()), level=level)
 
 
