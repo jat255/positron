@@ -797,6 +797,60 @@ def test_values_preview_formats_every_dtype(values: np.ndarray, expected: str):
     assert preview == expected
 
 
+def test_values_preview_float_strings_by_dtype():
+    values = [0.1, 28.02, 1 / 3, 1e-7, 1e20, -0.0, 123.0]
+    expected = {
+        # 1e-07 is a float16 subnormal; float16's own shortest form is "1e-07"
+        "float16": "[0.1, 28.0, 0.333, 1e-07, inf, -0.0, 123.0]",
+        "float32": "[0.1, 28.02, 0.333333, 1e-07, 1e+20, -0.0, 123.0]",
+        "float64": "[0.1, 28.02, 0.333333333333333, 1e-07, 1e+20, -0.0, 123.0]",
+    }
+    for dtype, text in expected.items():
+        with np.errstate(over="ignore"):
+            array = np.array(values, dtype=dtype)
+        assert get_inspector(ArrayGroup("Values", xr.DataArray(array))).get_display_value()[0] == (
+            text
+        ), dtype
+
+
+def test_values_preview_formats_longdouble_without_float_cast(monkeypatch: pytest.MonkeyPatch):
+    # The numpy formatting functions receive the longdouble itself, never a Python float.
+    received: list[Any] = []
+    for name in ("format_float_positional", "format_float_scientific"):
+        original = getattr(np, name)
+
+        def spy(value: Any, *args: Any, _original: Any = original, **kwargs: Any) -> str:
+            received.append(value)
+            return _original(value, *args, **kwargs)
+
+        monkeypatch.setattr(np, name, spy)
+    format_item = _preview_item_formatter(np.dtype(np.longdouble))
+    assert format_item(np.longdouble(2.5)) == "2.5"
+    assert received
+    assert all(type(value) is np.longdouble for value in received)
+
+    format_complex = _preview_item_formatter(np.dtype(np.clongdouble))
+    received.clear()
+    assert format_complex(np.clongdouble(1 + 2j)) == "1.0+2.0j"
+    assert all(type(value) is np.longdouble for value in received)
+
+
+def test_values_preview_longdouble_beyond_float64():
+    if np.finfo(np.longdouble).max <= np.finfo(np.float64).max:
+        pytest.skip("longdouble is no wider than float64 on this platform")
+    big = np.longdouble(np.finfo(np.float64).max) * 10
+    preview = get_inspector(ArrayGroup("Values", xr.DataArray(np.array([big])))).get_display_value()
+    assert preview[0] != "[inf]"
+    assert "e+309" in preview[0]
+
+
+def test_values_preview_complex_negative_zero_imaginary():
+    values = np.array([complex(1, -0.0), 3 - 4.5j, 2 + 0j])
+    assert np.signbit(values[0].imag)
+    preview = get_inspector(ArrayGroup("Values", xr.DataArray(values))).get_display_value()[0]
+    assert preview == "[1.0-0.0j, 3.0-4.5j, 2.0+0.0j]"
+
+
 def test_values_preview_3d_summarized():
     values = np.arange(10 * 10 * 10).reshape(10, 10, 10)
     preview = _values_preview(xr.DataArray(values))

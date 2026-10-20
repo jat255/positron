@@ -1738,11 +1738,24 @@ def _pandas_time_formatter(kind: str) -> Callable[[Any], str] | None:
 
 
 def _format_float(value: Any, digits: int) -> str:
-    """A float with at most `digits` significant digits; integral values keep a ".0"."""
-    text = f"{float(value):.{digits}g}"
-    if text.lstrip("-").isdigit():
-        text += ".0"
-    return text
+    """
+    A numpy float with at most `digits` significant digits, laid out like Python's "g" format.
+
+    The numpy scalar is formatted as is: a cast to a Python float would lose the range and
+    precision of a longdouble wider than float64. Integral values keep a ".0".
+    """
+    np = _numpy()
+    scientific = np.format_float_scientific(value, precision=digits - 1, unique=True, trim="-")
+    mantissa, _, exponent = scientific.partition("e")
+    if not exponent:
+        # nan or inf
+        return mantissa
+    if -4 <= int(exponent) < digits:
+        text = np.format_float_positional(
+            value, precision=digits, unique=True, fractional=False, trim="-"
+        )
+        return text if any(c in text for c in ".en") else f"{text}.0"
+    return f"{mantissa}e{int(exponent):+03d}"
 
 
 def _preview_item_formatter(dtype: Any) -> Callable[[Any], str]:
@@ -1763,8 +1776,10 @@ def _preview_item_formatter(dtype: Any) -> Callable[[Any], str]:
         digits = _numpy().finfo(dtype).precision
 
         def format_complex(item: Any) -> str:
-            imag = _format_float(abs(item.imag), digits)
-            sign = "-" if item.imag < 0 else "+"
+            np = _numpy()
+            # signbit keeps the sign of a negative zero, as numpy shows it
+            sign = "-" if np.signbit(item.imag) else "+"
+            imag = _format_float(np.abs(item.imag), digits)
             return f"{_format_float(item.real, digits)}{sign}{imag}j"
 
         return format_complex
