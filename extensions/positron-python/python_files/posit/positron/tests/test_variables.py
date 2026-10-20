@@ -1014,3 +1014,29 @@ def test_inspect_xarray_dataset_group_paths(
     assert [child.display_name for child in children] == ["sst", "anom"]
     for child in children:
         assert child.display_value.startswith("[time: 4 x lat: 3 x lon: 5]")
+
+
+def test_inspect_xarray_dataarray_length_is_child_count(
+    shell: PositronShell, variables_comm: DummyComm
+) -> None:
+    # The Variables pane adds a "more values" row when a variable's length is larger than the
+    # number of children it receives.
+    from .utils import make_dataset
+
+    ds = make_dataset(time=366)
+    shell.user_ns["ds"] = ds
+    shell.user_ns["time"] = ds["time"]
+
+    ds_path = [encode_access_key("ds")]
+    data_vars = _do_inspect([*ds_path, encode_access_key("Data variables")], variables_comm)
+    sst = next(child for child in data_vars if child.display_name == "sst")
+    sst_children = _do_inspect(
+        [*ds_path, encode_access_key("Data variables"), encode_access_key("sst")], variables_comm
+    )
+    assert [child.display_name for child in sst_children] == ["Coordinates", "Attributes", "Values"]
+    assert sst.length == len(sst_children)
+
+    time = _summarize_variable("time", shell.user_ns["time"])
+    assert time is not None
+    time_children = _do_inspect([encode_access_key("time")], variables_comm)
+    assert time.length == len(time_children)

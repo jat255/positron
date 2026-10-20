@@ -1667,6 +1667,9 @@ class MetadataRowInspector(PositronInspector[MetadataRow]):
     def has_children(self) -> bool:
         return False
 
+    def get_children(self) -> list[Any]:
+        return []
+
     def is_mutable(self) -> bool:
         return False
 
@@ -1789,7 +1792,9 @@ class XarrayDatasetInspector(PositronInspector["xr.Dataset"]):
         return "table"
 
     def get_length(self) -> int:
-        return len(self.value.data_vars)
+        # The Variables pane treats the length as the child count, and adds a "more values"
+        # row when it is larger than the number of children it receives.
+        return len(self.get_children())
 
     def get_size(self) -> int:
         return self.value.nbytes
@@ -1868,16 +1873,20 @@ class XarrayDataArrayInspector(PositronInspector["xr.DataArray"]):
         return "table"
 
     def get_length(self) -> int:
-        return int(self.value.shape[0]) if self.value.ndim > 0 else 0
+        # The Variables pane treats the length as the child count, and adds a "more values"
+        # row when it is larger than the number of children it receives.
+        return len(self.get_children())
 
     def get_size(self) -> int:
         return self.value.nbytes
 
     def has_children(self) -> bool:
-        da = self.value
-        return not (da.ndim == 0 and len(da.coords) == 0 and len(da.attrs) == 0)
+        return self.get_length() > 0
 
     def get_children(self) -> list[str]:
+        da = self.value
+        if da.ndim == 0 and len(da.coords) == 0 and len(da.attrs) == 0:
+            return []
         children = [ArrayGroup.COORDINATES, ArrayGroup.ATTRIBUTES]
         # A chunked (dask) array has no values preview, since building one would compute.
         if self.value.chunks is None:
@@ -1928,11 +1937,9 @@ class DaskArrayInspector(PositronInspector["DaskArray"]):
         return "table"
 
     def get_length(self) -> int:
-        array = self.value
-        # A dim's length is NaN when it depends on data that has not been computed
-        if array.ndim == 0 or not math.isfinite(array.shape[0]):
-            return 0
-        return int(array.shape[0])
+        # The Variables pane treats the length as the child count, and adds a "more values"
+        # row when it is larger than the number of children it receives.
+        return len(self.get_children())
 
     def get_size(self) -> int:
         return _dask_nbytes(self.value) or 0

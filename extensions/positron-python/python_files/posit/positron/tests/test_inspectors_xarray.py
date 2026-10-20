@@ -45,7 +45,7 @@ def test_inspect_xarray_dataset():
     assert ins.get_kind() == "table"
     assert ins.get_type_info() == "xarray.core.dataset.Dataset"
     assert ins.get_size() == ds.nbytes
-    assert ins.get_length() == 2
+    assert ins.get_length() == 5
     assert ins.has_children()
     assert not ins.has_viewer()
     assert list(ins.get_children()) == [
@@ -115,7 +115,7 @@ def test_inspect_xarray_dataarray():
     assert ins.get_display_type() == "DataArray [4x3x5] float32"
     assert ins.get_kind() == "table"
     assert ins.get_size() == da.nbytes
-    assert ins.get_length() == 4
+    assert ins.get_length() == 3
     assert ins.has_children()
     assert list(ins.get_children()) == ["Coordinates", "Attributes", "Values"]
     assert not ins.has_viewer()  # piece 2 changes this for 1-D/2-D
@@ -318,7 +318,7 @@ def test_inspect_bare_dask_array():
     assert type(ins) is DaskArrayInspector
     assert ins.get_kind() == "table"
     assert ins.get_display_type() == "Array [12x3x5] float32"
-    assert ins.get_length() == 12
+    assert ins.get_length() == 1
     assert ins.get_size() == 720
     assert list(ins.get_children()) == ["Dask metadata"]
     group = get_inspector(ins.get_child("Dask metadata"))
@@ -451,3 +451,68 @@ def test_dask_equals_detects_in_place_edit_of_eager_variable_named_none():
     assert get_inspector(snapshot).equals(ds)
     ds[None][0] = 5
     assert not get_inspector(snapshot).equals(ds)
+
+
+#
+# Child counts
+#
+
+_ARRAY_INSPECTORS = (
+    XarrayDatasetInspector,
+    XarrayDataArrayInspector,
+    DaskArrayInspector,
+    ArrayGroupInspector,
+    MetadataRowInspector,
+)
+
+
+def _assert_lengths_match_children(value: Any, depth: int = 0) -> int:
+    """
+    Check that every array inspector under value reports its child count as its length.
+
+    The Variables pane adds a "more values" row when a variable's length is larger than the
+    number of children it receives.
+    """
+    ins = get_inspector(value)
+    if type(ins) not in _ARRAY_INSPECTORS:
+        return 0
+    children = list(ins.get_children())
+    assert ins.get_length() == len(children), (type(ins).__name__, children)
+    assert ins.has_children() == (len(children) > 0)
+    checked = 1
+    if depth < 6:
+        for key in children:
+            checked += _assert_lengths_match_children(ins.get_child(key), depth + 1)
+    return checked
+
+
+@pytest.mark.parametrize(
+    "make_value",
+    [
+        pytest.param(make_dataset, id="dataset"),
+        pytest.param(make_lazy_dataset, id="dask-dataset"),
+        pytest.param(lambda: make_dataset()["sst"], id="dataarray"),
+        pytest.param(lambda: make_lazy_dataset()["sst"], id="dask-dataarray"),
+        pytest.param(lambda: make_dataset()["time"], id="dimension-coordinate"),
+        pytest.param(lambda: make_dataset()["sst"].isel(time=0), id="2d-slice"),
+        pytest.param(lambda: make_dataset()["sst"].isel(time=0)["time"], id="scalar-coordinate"),
+        pytest.param(lambda: make_dataset()["sst"].mean(), id="0d"),
+        pytest.param(lambda: xr.DataArray(3.0), id="0d-bare"),
+        pytest.param(lambda: make_lazy_dataset()["sst"].data, id="dask-array"),
+        pytest.param(lambda: MetadataRow("time: 4"), id="metadata-row"),
+    ],
+)
+def test_length_is_child_count(make_value: Any) -> None:
+    assert _assert_lengths_match_children(make_value()) > 0
+
+
+def test_length_is_child_count_for_groups() -> None:
+    ds = make_lazy_dataset()
+    for owner in (ds, ds["sst"]):
+        for name in ("Coordinates", "Data variables", "Attributes", "Values", "Dask metadata"):
+            if name == "Data variables" and owner is not ds:
+                continue
+            ins = get_inspector(ArrayGroup(name, owner))
+            assert ins.get_length() == len(list(ins.get_children()))
+    assert get_inspector(ArrayGroup("Values", make_dataset()["sst"])).get_length() == 0
+    assert get_inspector(ArrayGroup("Dask metadata", ds["sst"].data)).get_length() == 3
