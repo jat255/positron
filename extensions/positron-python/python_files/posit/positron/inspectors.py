@@ -1749,18 +1749,39 @@ def _array_values_preview(array: xr.DataArray, *, level: int = 0) -> tuple[str, 
     return _maybe_truncate_string(" ".join(text.split()), level=level)
 
 
+def _is_own_coordinate(array: xr.DataArray, name: Hashable) -> bool:
+    """
+    Whether the coordinate `name` of a DataArray is the DataArray itself.
+
+    The DataArray of a coordinate (for example `ds["time"]`) has itself as a coordinate, with the
+    same variable. A distinct coordinate can share the DataArray's name, so the name alone does
+    not decide. Only metadata and object identity are compared, so nothing is read or computed.
+    """
+    if name != array.name:
+        return False
+    coord = array.coords[name].variable
+    own = array.variable
+    if coord is own:
+        return True
+    if coord.dims != own.dims or coord.shape != own.shape or coord.dtype != own.dtype:
+        return False
+    # Some xarray versions wrap the same data in a new Variable.
+    data = getattr(own, "_data", None)
+    return data is not None and getattr(coord, "_data", None) is data
+
+
 def _coordinate_names(owner: xr.Dataset | xr.DataArray) -> list[Hashable]:
     """
     The names listed in the Coordinates group of an xarray object.
 
-    The DataArray of a coordinate (for example `ds["time"]`) has itself as a coordinate. Listing it
-    would nest the same row inside itself forever, so a DataArray omits the coordinate that has
-    its own name.
+    A DataArray omits the coordinate that is the DataArray itself. Listing it would nest the same
+    row inside itself forever.
     """
     names = list(owner.coords)
     xr_mod = sys.modules.get("xarray")
     if xr_mod is not None and isinstance(owner, xr_mod.DataArray) and owner.name in owner.coords:
-        names = [name for name in names if name != owner.name]
+        array = cast("xr.DataArray", owner)
+        names = [name for name in names if not _is_own_coordinate(array, name)]
     return names
 
 

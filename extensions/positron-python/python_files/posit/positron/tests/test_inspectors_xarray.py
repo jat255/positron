@@ -558,6 +558,42 @@ def test_dataarray_without_coordinates_keeps_empty_group():
     assert get_inspector(ins.get_child("Coordinates")).get_display_value()[0] == "(none)"
 
 
+def test_same_named_distinct_coordinate_is_listed():
+    # A coordinate can share the DataArray's name without being the DataArray itself.
+    da = xr.DataArray([1, 2], dims="x", coords={"x": [10, 20]}, name="x")
+    ins = get_inspector(da)
+    assert list(ins.get_children()) == ["Coordinates", "Attributes", "Values"]
+    coords = get_inspector(ins.get_child("Coordinates"))
+    assert list(coords.get_children()) == ["x"]
+    assert coords.has_child("x")
+    assert coords.get_child("x").to_numpy().tolist() == [10, 20]
+    assert _assert_lengths_match_children(da) > 0
+
+
+def test_sliced_dimension_coordinate_nesting_ends():
+    # Slicing gives the DataArray and its coordinate separate variables, so the coordinate is
+    # listed once; the coordinate's own DataArray then hides it.
+    da = make_dataset()["time"].isel(time=slice(0, 2))
+    coords = get_inspector(get_inspector(da).get_child("Coordinates"))
+    assert list(coords.get_children()) == ["time"]
+    inner = get_inspector(coords.get_child("time"))
+    assert list(inner.get_children()) == ["Attributes", "Values"]
+
+
+def test_dask_backed_coordinate_does_not_list_itself():
+    from .utils import make_compute_bomb
+
+    ds = make_lazy_dataset()
+    # The bomb makes any computation fail the test.
+    ds.coords["depth"] = (("time", "lat"), make_compute_bomb(np.zeros((12, 3)), chunks=(6, 3)))
+    da = ds["depth"]
+    ins = get_inspector(da)
+    assert list(ins.get_children()) == ["Coordinates", "Attributes", "Dask metadata"]
+    assert sorted(get_inspector(ins.get_child("Coordinates")).get_children()) == ["lat", "time"]
+    assert _assert_lengths_match_children(da) > 0
+    assert _walk(da) > 5
+
+
 #
 # Datetime values preview
 #
