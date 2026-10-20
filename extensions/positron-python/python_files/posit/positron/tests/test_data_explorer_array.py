@@ -792,3 +792,64 @@ def test_array_view_datetime_summary_without_pandas(
         summary = _summary(dxf, "times", 0)
     assert summary["type_display"] == "datetime"
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+#
+# xarray Variable
+#
+
+
+def test_array_view_variable_2d(dxf: DataExplorerFixture):
+    ds = make_dataset()
+    variable = ds.variables["sst"][0]  # dims (lat, lon), no coordinates
+    assert get_inspector(variable).has_viewer()
+    dxf.register_table("v", variable)
+    state = dxf.get_state("v")
+    assert state["display_name"] == "v (lat, lon)"
+    # A Variable has no coordinates, so the grid shows its own row numbers.
+    assert not state["has_row_labels"]
+    assert [c["column_name"] for c in dxf.get_schema("v")] == ["0", "1", "2", "3", "4"]
+    assert _column_labels(dxf, "v") == ["lon = 0", "lon = 1", "lon = 2", "lon = 3", "lon = 4"]
+    assert _column_values(dxf, "v", 1, 3) == ["1.00", "6.00", "11.00"]
+
+
+def test_array_view_index_variable(dxf: DataExplorerFixture):
+    # Like any Variable, an IndexVariable has no name and no coordinate to label its rows.
+    ds = make_dataset()
+    dxf.register_table("t", ds.variables["time"])
+    assert dxf.get_state("t")["display_name"] == "t (time)"
+    assert not dxf.get_state("t")["has_row_labels"]
+    assert [c["column_name"] for c in dxf.get_schema("t")] == ["0"]
+    assert _column_values(dxf, "t", 0, 2) == ["2020-01-01 00:00:00", "2020-01-02 00:00:00"]
+
+
+def test_variable_viewer_respects_size_limit():
+    ds = make_dataset()
+    assert not _value_type_is_supported(ds.variables["sst"])  # 3-D
+    assert _value_type_is_supported(ds.variables["lat"])
+
+    big = _lazily_indexed_dataarray((40000, 40000), "float32").variable
+    assert not _value_type_is_supported(big)
+    assert not get_inspector(big).has_viewer()
+    with pytest.raises(TypeError):
+        _ArrayTable.from_value(big)
+
+    dask_array = pytest.importorskip("dask.array")
+    xr = pytest.importorskip("xarray")
+    assert not _value_type_is_supported(xr.Variable(("y", "x"), dask_array.zeros((6000, 6000))))
+    assert _value_type_is_supported(xr.Variable(("y", "x"), dask_array.zeros((10, 10))))
+
+
+def test_lazily_indexed_variable_under_limit_opens(dxf: DataExplorerFixture):
+    values = np.arange(6.0).reshape(2, 3)
+    variable = _lazily_indexed_dataarray((2, 3), values.dtype, values).variable
+    dxf.register_table("lazy", variable)
+    assert _column_values(dxf, "lazy", 1, 2) == ["1.00", "4.00"]
+
+
+def test_array_view_unavailable_message_variable():
+    ds = make_dataset()
+    assert _array_view_unavailable_message(ds.variables["sst"], "v") == (
+        "v has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. v.isel(time=0)"
+    )

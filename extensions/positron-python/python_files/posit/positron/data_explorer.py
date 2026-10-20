@@ -2947,12 +2947,12 @@ ARRAY_VIEW_MAX_LAZY_BYTES = 100 * 1024 * 1024
 
 
 def _is_array(value: Any) -> bool:
-    """Whether value is a numpy array, xarray DataArray, or dask array."""
+    """Whether value is a numpy array, xarray DataArray or Variable, or dask array."""
     np_module = sys.modules.get("numpy")
     xr_module = sys.modules.get("xarray")
     return (
         (np_module is not None and isinstance(value, np_module.ndarray))
-        or (xr_module is not None and isinstance(value, xr_module.DataArray))
+        or (xr_module is not None and isinstance(value, (xr_module.DataArray, xr_module.Variable)))
         or _is_dask_array(value)
     )
 
@@ -2972,9 +2972,9 @@ def _array_lazy_nbytes(value: Any) -> int | None:
         if None in dask_sizes:
             return None
         return sum(cast("list[int]", dask_sizes))
-    # A DataArray that is not dask-backed. xarray has no public check for whether its data is
-    # loaded, so read Variable._in_memory, and treat the data as lazy if it is missing.
-    if getattr(value.variable, "_in_memory", False):
+    # A DataArray or Variable that is not dask-backed. xarray has no public check for whether its
+    # data is loaded, so read Variable._in_memory, and treat the data as lazy if it is missing.
+    if getattr(getattr(value, "variable", value), "_in_memory", False):
         return 0
     return int(value.nbytes)
 
@@ -2990,7 +2990,7 @@ def _is_lazy_object_array(value: Any, nbytes: int | None) -> bool:
 
 
 def _is_viewable_array(value: Any) -> bool:
-    """Whether value is a 1-D or 2-D numpy array, xarray DataArray, or dask array to view."""
+    """Whether value is a 1-D or 2-D numpy array, xarray DataArray or Variable, or dask array."""
     if not _is_array(value) or value.ndim not in (1, 2):
         return False
     if value.dtype.names is not None:
@@ -3079,7 +3079,7 @@ def _literal_node(value: Any) -> ast.expr | None:
 def _slice_example(value: Any, node: ast.expr) -> str | None:
     """Code that selects the first slice along the first dim of value, which node evaluates to."""
     xr_module = sys.modules.get("xarray")
-    if xr_module is None or not isinstance(value, xr_module.DataArray):
+    if xr_module is None or not isinstance(value, (xr_module.DataArray, xr_module.Variable)):
         return ast.unparse(ast.Subscript(value=node, slice=ast.Constant(0), ctx=ast.Load()))
     dim = value.dims[0]
     isel = ast.Attribute(value=node, attr="isel", ctx=ast.Load())
@@ -3158,6 +3158,11 @@ class _ArrayTable:
         mask = None
         label_units = None
         xr_module = sys.modules.get("xarray")
+        if xr_module is not None and isinstance(value, xr_module.Variable):
+            # A DataArray without coordinates or a name shows a Variable's dims and attrs. It
+            # wraps the Variable's data without loading it. The base Variable of an
+            # IndexVariable keeps the DataArray from adding a coordinate that repeats its values.
+            value = xr_module.DataArray(value.to_base_variable())
         if xr_module is not None and isinstance(value, xr_module.DataArray):
             # .values computes a dask-backed DataArray
             values = np.asarray(value.values)
