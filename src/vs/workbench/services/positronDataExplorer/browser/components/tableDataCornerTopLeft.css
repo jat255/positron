@@ -52,7 +52,10 @@
 	justify-self: start;
 }
 
+/* The name gives up width before the arrow does, and truncates with an ellipsis. */
 .table-data-corner-top-left .axis-name .name {
+	min-width: 0;
+	flex: 0 1 auto;
 	overflow: hidden;
 	white-space: nowrap;
 	text-overflow: ellipsis;
