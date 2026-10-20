@@ -1753,21 +1753,11 @@ def _is_own_coordinate(array: xr.DataArray, name: Hashable) -> bool:
     """
     Whether the coordinate `name` of a DataArray is the DataArray itself.
 
-    The DataArray of a coordinate (for example `ds["time"]`) has itself as a coordinate, with the
-    same variable. A distinct coordinate can share the DataArray's name, so the name alone does
-    not decide. Only metadata and object identity are compared, so nothing is read or computed.
+    The DataArray of a coordinate (for example `ds["time"]`) has itself as a coordinate, and
+    xarray gives both the same Variable object. A distinct coordinate can share the DataArray's
+    name, or even its data, but never its Variable. Nothing is read or computed.
     """
-    if name != array.name:
-        return False
-    coord = array.coords[name].variable
-    own = array.variable
-    if coord is own:
-        return True
-    if coord.dims != own.dims or coord.shape != own.shape or coord.dtype != own.dtype:
-        return False
-    # Some xarray versions wrap the same data in a new Variable.
-    data = getattr(own, "_data", None)
-    return data is not None and getattr(coord, "_data", None) is data
+    return name == array.name and array.coords[name].variable is array.variable
 
 
 def _coordinate_names(owner: xr.Dataset | xr.DataArray) -> list[Hashable]:

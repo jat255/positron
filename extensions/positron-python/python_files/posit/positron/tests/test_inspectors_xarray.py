@@ -570,6 +570,22 @@ def test_same_named_distinct_coordinate_is_listed():
     assert _assert_lengths_match_children(da) > 0
 
 
+def test_same_named_coordinate_sharing_data_is_listed():
+    # A non-dimension coordinate that shares the DataArray's ndarray, with its own attrs, is
+    # still a separate coordinate.
+    base = xr.DataArray(np.arange(3.0), dims="y", name="x")
+    coord = base.variable.copy(deep=False)
+    coord.attrs["units"] = "m"
+    da = base.assign_coords(x=coord)
+    assert da.coords["x"].variable._data is da.variable._data  # noqa: SLF001
+    ins = get_inspector(da)
+    assert list(ins.get_children()) == ["Coordinates", "Attributes", "Values"]
+    coords = get_inspector(ins.get_child("Coordinates"))
+    assert list(coords.get_children()) == ["x"]
+    assert coords.get_child("x").attrs == {"units": "m"}
+    assert _assert_lengths_match_children(da) > 0
+
+
 def test_sliced_dimension_coordinate_nesting_ends():
     # Slicing gives the DataArray and its coordinate separate variables, so the coordinate is
     # listed once; the coordinate's own DataArray then hides it.
