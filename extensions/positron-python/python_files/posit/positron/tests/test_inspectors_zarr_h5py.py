@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -18,6 +19,8 @@ from positron.inspectors import (
     MetadataRow,
     ZarrArrayInspector,
     ZarrGroupInspector,
+    _is_remote_url,
+    _zarr_is_remote,
     get_inspector,
 )
 from positron.variables import _resolve_value_from_path, _summarize_children
@@ -316,3 +319,59 @@ def test_zarr_array_ignores_malformed_dim_names(zarr_group, names):
     array = _create_array(zarr_group, "odd", shape=(3, 2), dtype="f4")
     array.attrs["_ARRAY_DIMENSIONS"] = names
     assert get_inspector(array).get_display_value()[0] == "[3 x 2] zarr.Array"
+
+
+#
+# Remote stores
+#
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("https://storage.googleapis.com/bucket/store.zarr", True),
+        ("s3://bucket/store.zarr", True),
+        ("gs://bucket/store.zarr", True),
+        ("simplecache::s3://bucket/store.zarr", True),
+        ("file:///data/store.zarr", False),
+        ("memory://store.zarr", False),
+        ("/data/oisst.nc", False),
+        ("C:\\data\\oisst.nc", False),
+        (None, False),
+    ],
+)
+def test_is_remote_url(source, expected):
+    assert _is_remote_url(source) is expected
+
+
+class S3Store:
+    """Named like obstore's S3 store, which zarr's ObjectStore wraps."""
+
+
+@pytest.mark.parametrize(
+    ("store", "expected"),
+    [
+        (SimpleNamespace(fs=SimpleNamespace(protocol=("http", "https"))), True),
+        (SimpleNamespace(fs=SimpleNamespace(protocol="s3")), True),
+        (SimpleNamespace(fs=SimpleNamespace(protocol=("file", "local"))), False),
+        (SimpleNamespace(fs=SimpleNamespace(protocol="memory")), False),
+        (SimpleNamespace(store=S3Store()), True),
+        (SimpleNamespace(), False),
+    ],
+)
+def test_zarr_is_remote(store, expected):
+    assert _zarr_is_remote(SimpleNamespace(store=store)) is expected
+
+
+def test_zarr_local_store_is_not_remote(zarr_group):
+    assert not _zarr_is_remote(zarr_group)
+    assert not _zarr_is_remote(zarr_group["sst"])
+
+
+def test_remote_zarr_display_value(zarr_group, mocker):
+    mocker.patch("positron.inspectors._zarr_is_remote", return_value=True)
+    group_type = type(zarr_group).__name__
+    assert get_inspector(zarr_group).get_display_value()[0] == (
+        f"[2 members] zarr.{group_type} (remote)"
+    )
+    assert get_inspector(zarr_group["sst"]).get_display_value()[0].endswith("zarr.Array (remote)")

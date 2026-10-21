@@ -1027,3 +1027,21 @@ def test_dask_viewer_respects_size_limit():
     big = da_mod.zeros((6000, 6000))  # 288 MB, never computed
     assert not get_inspector(big).has_viewer()
     assert not get_inspector(xr.DataArray(big, dims=("y", "x"))).has_viewer()
+
+
+def test_xarray_opened_from_a_url_is_remote():
+    ds = make_dataset()
+    ds.encoding["source"] = "https://storage.googleapis.com/bucket/store.zarr"
+    assert get_inspector(ds).get_display_value()[0] == "[3 dims x 2 vars] xarray.Dataset (remote)"
+    lazy = make_lazy_dataset()
+    lazy.encoding["source"] = "s3://bucket/store.zarr"
+    assert get_inspector(lazy).get_display_value()[0].endswith("xarray.Dataset (dask, remote)")
+    da = ds["sst"]
+    da.encoding["source"] = "https://example.com/sst.nc"
+    assert get_inspector(da).get_display_value()[0].endswith("xarray.DataArray (remote)")
+
+
+def test_xarray_opened_from_a_local_file_is_not_remote():
+    ds = make_dataset()
+    ds.encoding["source"] = "/data/oisst.nc"
+    assert get_inspector(ds).get_display_value()[0] == "[3 dims x 2 vars] xarray.Dataset"

@@ -1938,6 +1938,52 @@ class ArrayGroupInspector(PositronInspector[ArrayGroup]):
         return False
 
 
+# Protocols of fsspec filesystems and URLs whose data is on this machine
+_LOCAL_PROTOCOLS = frozenset({"file", "local", "memory"})
+# A URL scheme, such as "https://" or "s3://". A Windows path, such as C:\data, has none.
+_URL_SCHEME = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]+)://")
+# Remote stores of zarr's ObjectStore, which wraps an obstore store
+_OBSTORE_REMOTE_STORES = frozenset({"AzureStore", "GCSStore", "HTTPStore", "S3Store"})
+
+
+def _is_remote_url(source: Any) -> bool:
+    """
+    Whether source is the URL of data on another machine, such as "https://..." or "s3://...".
+
+    A chained fsspec URL, such as "simplecache::s3://...", is remote when its last part is.
+    """
+    if not isinstance(source, str):
+        return False
+    match = _URL_SCHEME.match(source.split("::")[-1])
+    return match is not None and match.group(1).lower() not in _LOCAL_PROTOCOLS
+
+
+def _zarr_is_remote(node: Any) -> bool:
+    """Whether a zarr array or group is stored on another machine, read without any I/O."""
+    store = node.store
+    # FsspecStore (zarr 3) and FSStore (zarr 2) name their filesystem's protocols.
+    fs = getattr(store, "fs", None)
+    if fs is not None:
+        protocols = fs.protocol if isinstance(fs.protocol, (list, tuple)) else (fs.protocol,)
+        return not _LOCAL_PROTOCOLS.intersection(protocols)
+    return type(getattr(store, "store", None)).__name__ in _OBSTORE_REMOTE_STORES
+
+
+def _xarray_flags(value: Any) -> str:
+    """
+    The suffix of an xarray object's display value, such as " (dask, remote)", or "".
+
+    "remote" means that xarray opened it from a URL, which it records as the "source" encoding.
+    Variables selected from a Dataset do not have that encoding.
+    """
+    flags = []
+    if _is_dask_backed(value):
+        flags.append("dask")
+    if _is_remote_url(getattr(value, "encoding", {}).get("source")):
+        flags.append("remote")
+    return f" ({', '.join(flags)})" if flags else ""
+
+
 class XarrayDatasetInspector(PositronInspector["xr.Dataset"]):
     CLASS_QNAME = ("xarray.core.dataset.Dataset", "xarray.Dataset")
 
@@ -1947,8 +1993,7 @@ class XarrayDatasetInspector(PositronInspector["xr.Dataset"]):
     def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
         ds = self.value
         text = f"[{len(ds.sizes)} dims x {len(ds.data_vars)} vars] xarray.Dataset"
-        if _is_dask_backed(ds):
-            text += " (dask)"
+        text += _xarray_flags(ds)
         return _maybe_truncate_string(text, level=level)[0], True
 
     def get_display_type(self) -> str:
@@ -2030,8 +2075,7 @@ class _XarrayArrayInspector(PositronInspector[XarrayArray], ABC):
         else:
             shape = " x ".join(f"{dim}: {size}" for dim, size in zip(array.dims, array.shape))
         text = f"[{shape}] xarray.{self._type_name()}"
-        if _is_dask_backed(array):
-            text += " (dask)"
+        text += _xarray_flags(array)
         return _maybe_truncate_string(text, level=level)[0], True
 
     def get_display_type(self) -> str:
@@ -2300,6 +2344,9 @@ class _StoredArrayInspector(PositronInspector[Any], ABC):
     def _is_open(self) -> bool:
         return True
 
+    def _is_remote(self) -> bool:
+        return False
+
     @abstractmethod
     def _dims(self) -> list[str] | None:
         """The dim names, or None when the store does not name every dim."""
@@ -2313,6 +2360,8 @@ class _StoredArrayInspector(PositronInspector[Any], ABC):
         if not self._is_open():
             return repr(array), False
         text = f"[{_shape_text(array.shape, self._dims())}] {self.LIBRARY}.{type(array).__name__}"
+        if self._is_remote():
+            text += " (remote)"
         return _maybe_truncate_string(text, level=level)[0], True
 
     def get_display_type(self) -> str:
@@ -2372,6 +2421,9 @@ class _StoredGroupInspector(PositronInspector[Any], ABC):
     def _is_open(self) -> bool:
         return True
 
+    def _is_remote(self) -> bool:
+        return False
+
     def _members(self) -> list[str]:
         # Listing a remote zarr store without consolidated metadata takes a request, so the
         # inspector lists the members once, for the row and all its children.
@@ -2393,6 +2445,8 @@ class _StoredGroupInspector(PositronInspector[Any], ABC):
         if not self._is_open():
             return repr(group), False
         text = f"[{_count(len(self._members()), 'member')}] {self.LIBRARY}.{type(group).__name__}"
+        if self._is_remote():
+            text += " (remote)"
         return _maybe_truncate_string(text, level=level)[0], True
 
     def get_display_type(self) -> str:
@@ -2445,6 +2499,9 @@ class ZarrArrayInspector(_StoredArrayInspector):
     LIBRARY = "zarr"
     STORE = "Store"
 
+    def _is_remote(self) -> bool:
+        return _zarr_is_remote(self.value)
+
     def _dims(self) -> list[str] | None:
         return _zarr_dims(self.value)
 
@@ -2473,6 +2530,9 @@ class ZarrArrayInspector(_StoredArrayInspector):
 class ZarrGroupInspector(_StoredGroupInspector):
     CLASS_QNAME = _ZARR_GROUP_QNAMES
     LIBRARY = "zarr"
+
+    def _is_remote(self) -> bool:
+        return _zarr_is_remote(self.value)
 
     # Compared by identity, like ZarrArrayInspector. Listing the members of a remote store without
     # consolidated metadata takes a request per listing.
