@@ -2708,7 +2708,9 @@ def _hyperspy_axis_text(axis: Any) -> str:
     parts = ["navigation" if axis.navigate else "signal", _count(axis.size, "point")]
     if axis.size > 0:
         values = axis.axis
-        extent = f"{_hyperspy_axis_value(values[0])} to {_hyperspy_axis_value(values[-1])}"
+        # The two ends are formatted together, so that close but distinct ends stay distinct.
+        first, last = _hyperspy_axis_labels([values[0], values[-1]])
+        extent = f"{first} to {last}"
         units = _hyperspy_text(axis.units)
         parts.append(extent if units is None else f"{extent} {units}")
     # Axes of HyperSpy versions before 1.7 are all uniform and have no is_uniform.

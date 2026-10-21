@@ -172,3 +172,12 @@ def test_non_uniform_axis_text_has_6_digits():
     s = hs.signals.Signal1D(np.zeros(3), axes=[axis])
     row = get_inspector(ArrayGroup(ArrayGroup.AXES, s)).get_child(0)
     assert row.text == "signal, 3 points, 1.59997 to 5.57245, non-uniform"
+
+
+def test_axis_text_keeps_close_ends_distinct():
+    s = hs.signals.Signal1D(np.zeros(2))
+    (axis,) = s.axes_manager.signal_axes
+    axis.offset = 100.0000001
+    axis.scale = 1e-7
+    row = get_inspector(ArrayGroup(ArrayGroup.AXES, s)).get_child(0)
+    assert row.text == "signal, 2 points, 100.0000001 to 100.0000002, step 1e-07"
