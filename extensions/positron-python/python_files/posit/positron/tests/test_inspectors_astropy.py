@@ -257,5 +257,6 @@ def test_fits_viewer_size_limit(tmp_path, mocker):
         assert get_inspector(hdul["SCALED"]).get_display_type() == "ImageHDU [4x4]"
         assert not get_inspector(hdul["SCALED"]).has_viewer()
         # Data already in memory has no size limit.
-        _ = hdul["SCALED"].data
-        assert get_inspector(hdul["SCALED"]).has_viewer()
+        hdu: Any = hdul["SCALED"]
+        _ = hdu.data
+        assert get_inspector(hdu).has_viewer()
