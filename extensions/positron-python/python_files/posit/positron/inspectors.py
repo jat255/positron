@@ -2352,13 +2352,22 @@ class _StoredGroupInspector(PositronInspector[Any], ABC):
 
     LIBRARY: str
 
+    def __init__(self, value: Any) -> None:
+        super().__init__(value)
+        self._member_names: list[str] | None = None
+
     def _is_open(self) -> bool:
         return True
 
     def _members(self) -> list[str]:
-        return list(self.value.keys())
+        # Listing a remote zarr store without consolidated metadata takes a request, so the
+        # inspector lists the members once, for the row and all its children.
+        if self._member_names is None:
+            self._member_names = list(self.value.keys())
+        return self._member_names
 
     def _member(self, name: str) -> Any:
+        """The member called name, read without listing the group. Raises KeyError if missing."""
         return self.value[name]
 
     def get_display_name(self, key: Any) -> str:
@@ -2400,7 +2409,7 @@ class _StoredGroupInspector(PositronInspector[Any], ABC):
     def get_child(self, key: Any) -> Any:
         if type(key) is int and key == _GROUP_ATTRIBUTES_KEY:
             return ArrayGroup(ArrayGroup.ATTRIBUTES, self.value)
-        if isinstance(key, str) and key in self._members():
+        if isinstance(key, str):
             return self._member(key)
         raise KeyError(key)
 
@@ -2517,6 +2526,8 @@ class H5pyGroupInspector(_StoredGroupInspector):
     def _member(self, name: str) -> Any:
         group = self.value
         link = group.get(name, getlink=True)
+        if link is None:
+            raise KeyError(name)
         if isinstance(link, sys.modules["h5py"].ExternalLink):
             # Following an external link would open another file.
             return MetadataRow(f"external link to {link.filename}:{link.path}")

@@ -287,3 +287,21 @@ def test_h5py_inspection_reads_metadata_only(h5_file, mocker):
     mocker.patch.object(h5py.Dataset, "read_direct", fail)
     mocker.patch.object(h5py.Dataset, "__array__", fail)
     assert _walk(h5_file) > 10
+
+
+@pytest.mark.parametrize("kind", ["zarr", "h5py"])
+def test_group_is_listed_once_per_summary(kind, zarr_group, h5_file, mocker):
+    # Listing a remote zarr store without consolidated metadata takes a request.
+    group = zarr_group if kind == "zarr" else h5_file
+    keys = mocker.spy(type(group), "keys")
+    summaries = _summarize_children(group)
+    assert len(summaries) == len(list(get_inspector(group).get_children()))
+    keys.reset_mock()
+    _summarize_children(group)
+    # Each child group lists its own members, for its member count.
+    assert [call.args[0] for call in keys.call_args_list].count(group) == 1
+
+
+def test_h5py_missing_member(h5_file):
+    with pytest.raises(KeyError):
+        get_inspector(h5_file).get_child("missing")
