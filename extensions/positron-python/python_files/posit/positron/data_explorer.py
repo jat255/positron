@@ -114,10 +114,10 @@ from .data_explorer_comm import (
 from .inspectors import (
     _dask_nbytes,
     _dask_variables,
-    _fits_data_nbytes,
     _fits_data_readable,
     _fits_header_int,
     _fits_image_dims,
+    _fits_image_read_nbytes,
     _format_name_list,
     _format_nbytes,
     _hyperspy_array_axes,
@@ -3017,17 +3017,18 @@ def _is_viewable_array(value: Any) -> bool:
     """
     Whether value is one of the arrays that _is_array accepts, with 1 or 2 dims.
 
-    A HyperSpy signal or an astropy NDData is viewable when its data is. A FITS image HDU is
-    checked against its header, without reading its data.
+    A HyperSpy signal or an astropy NDData is viewable when its data is, and so is a FITS image
+    HDU whose data has been read. Another FITS image HDU is checked against its header, without
+    reading its data.
     """
-    if _is_fits_image_hdu(value):
+    if _is_fits_image_hdu(value) and not getattr(value, "_data_loaded", False):
         header = value.header
         return (
             _fits_header_int(header, "NAXIS") in (1, 2)
             and _fits_data_readable(value)
-            and _fits_data_nbytes(header) <= ARRAY_VIEW_MAX_LAZY_BYTES
+            and _fits_image_read_nbytes(header) <= ARRAY_VIEW_MAX_LAZY_BYTES
         )
-    if _is_hyperspy_signal(value) or _is_nddata(value):
+    if _is_hyperspy_signal(value) or _is_nddata(value) or _is_fits_image_hdu(value):
         value = value.data
     if not _is_array(value) or value.ndim not in (1, 2):
         return False

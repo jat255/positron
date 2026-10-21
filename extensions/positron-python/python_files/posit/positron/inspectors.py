@@ -3090,6 +3090,24 @@ def _fits_data_nbytes(header: Any) -> int:
     return bitpix // 8 * gcount * (pcount + elements)
 
 
+def _fits_is_scaled(header: Any) -> bool:
+    """Whether the BSCALE or BZERO keywords of a FITS image scale its values when they are read."""
+    return header.get("BSCALE", 1) != 1 or header.get("BZERO", 0) != 0
+
+
+def _fits_image_read_nbytes(header: Any) -> int:
+    """
+    The memory that reading a FITS image takes, read from its header.
+
+    astropy reads scaled values as a wider dtype than BITPIX, at most 8 bytes per value, so a
+    scaled image counts 8 bytes per value.
+    """
+    elements = math.prod(_fits_image_shape(header))
+    if _fits_is_scaled(header):
+        return 8 * elements
+    return abs(_fits_header_int(header, "BITPIX", 8)) // 8 * elements
+
+
 def _fits_data_readable(hdu: Any) -> bool:
     """
     Whether reading the data of a FITS HDU would succeed.
@@ -3141,9 +3159,10 @@ class FitsHDUInspector(PositronInspector[Any]):
         header = hdu.header
         shape = "x".join(str(size) for size in _fits_image_shape(header))
         # Scaled data (BSCALE or BZERO) is read as another dtype than BITPIX gives.
-        scaled = header.get("BSCALE", 1) != 1 or header.get("BZERO", 0) != 0
         dtype = _FITS_BITPIX_DTYPES.get(_fits_header_int(header, "BITPIX"))
-        return f"{name} [{shape}]" if scaled or dtype is None else f"{name} [{shape}] {dtype}"
+        if _fits_is_scaled(header) or dtype is None:
+            return f"{name} [{shape}]"
+        return f"{name} [{shape}] {dtype}"
 
     def get_kind(self) -> str:
         return "table"

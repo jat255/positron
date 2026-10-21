@@ -238,3 +238,24 @@ def test_fits_closed_file(tmp_path):
     ins = get_inspector(hdul[0])
     assert ins.get_children() == ["Header"]
     assert not ins.has_viewer()
+
+
+def test_fits_viewer_size_limit(tmp_path, mocker):
+    import positron.data_explorer
+
+    mocker.patch.object(positron.data_explorer, "ARRAY_VIEW_MAX_LAZY_BYTES", 100)
+    path = tmp_path / "sizes.fits"
+    scaled = fits.ImageHDU(np.zeros((4, 4), dtype="int16"), name="SCALED")
+    scaled.header["BSCALE"] = 2.0
+    fits.HDUList([fits.PrimaryHDU(np.zeros((10, 10), dtype="uint8")), scaled]).writeto(
+        path, output_verify="silentfix"
+    )
+    with fits.open(path) as hdul:
+        # 100 bytes of uint8 values, within the limit until read
+        assert get_inspector(hdul[0]).has_viewer()
+        # 32 bytes on disk, but its scaled values are read as a wider dtype.
+        assert get_inspector(hdul["SCALED"]).get_display_type() == "ImageHDU [4x4]"
+        assert not get_inspector(hdul["SCALED"]).has_viewer()
+        # Data already in memory has no size limit.
+        _ = hdul["SCALED"].data
+        assert get_inspector(hdul["SCALED"]).has_viewer()
