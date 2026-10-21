@@ -142,6 +142,8 @@ def test_inspect_plain_nddata():
     assert get_inspector(nddata).get_display_value()[0] == "[2 x 3 x 4] astropy.NDData"
     # Without a unit, uncertainty, mask, WCS, or metadata, only the data is listed.
     assert _display_names(nddata) == ["Data"]
+    big_endian = CCDData(np.zeros(2, dtype=">i2"), unit="adu")
+    assert get_inspector(big_endian).get_display_type() == "CCDData [2] int16"
     assert not get_inspector(nddata).has_viewer()
 
 
