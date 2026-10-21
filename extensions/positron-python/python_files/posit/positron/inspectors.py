@@ -2681,13 +2681,26 @@ def _hyperspy_array_axes(signal: Any) -> list[tuple[str, Any]]:
 
 
 def _hyperspy_axis_value(value: Any) -> str:
-    """
-    A calibrated axis value, such as "100.5".
+    """A calibrated axis value with 6 significant digits, such as "100.5"."""
+    return _format_float(_numpy().float64(value), 6)
 
-    An axis computes its values as offset + scale * index, so they are rounded to 12 significant
-    digits to hide the rounding error of that sum.
+
+def _hyperspy_axis_labels(values: Any) -> list[str]:
     """
-    return _format_float(_numpy().float64(value), 12)
+    The calibrated values of an axis as labels, such as "100.5".
+
+    Each label has the fewest significant digits, from 6 to 12, that keep distinct values
+    distinct. An axis computes its values as offset + scale * index, and 12 digits still hide the
+    rounding error of that sum.
+    """
+    np = _numpy()
+    values = np.asarray(values, dtype=np.float64)
+    distinct = len({_format_float(value, 12) for value in values})
+    for digits in range(6, 12):
+        labels = [_format_float(value, digits) for value in values]
+        if len(set(labels)) == distinct:
+            return labels
+    return [_format_float(value, 12) for value in values]
 
 
 def _hyperspy_axis_text(axis: Any) -> str:

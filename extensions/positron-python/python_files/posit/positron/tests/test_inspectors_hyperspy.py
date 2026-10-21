@@ -16,6 +16,7 @@ from positron.inspectors import (
     HyperspySignalInspector,
     HyperspyTreeInspector,
     MetadataRow,
+    _hyperspy_axis_labels,
     get_inspector,
 )
 from positron.variables import _resolve_value_from_path, _summarize_children
@@ -157,3 +158,17 @@ def test_signal_non_uniform_axis():
     assert get_inspector(ins.get_child(0)).get_display_value()[0] == (
         "signal, 4 points, 1.0 to 8.0 eV, non-uniform"
     )
+
+
+def test_axis_labels_use_the_fewest_digits_that_stay_distinct():
+    # Rounding error of offset + scale * index is hidden.
+    assert _hyperspy_axis_labels(100.2 + 0.1 * np.arange(3)) == ["100.2", "100.3", "100.4"]
+    # Values that differ only in the 8th digit keep 8 digits.
+    assert _hyperspy_axis_labels([1.0000001, 1.0000002]) == ["1.0000001", "1.0000002"]
+
+
+def test_non_uniform_axis_text_has_6_digits():
+    axis = {"axis": np.array([1.59997158398, 2.5, 5.57244872918]), "name": "Energy"}
+    s = hs.signals.Signal1D(np.zeros(3), axes=[axis])
+    row = get_inspector(ArrayGroup(ArrayGroup.AXES, s)).get_child(0)
+    assert row.text == "signal, 3 points, 1.59997 to 5.57245, non-uniform"

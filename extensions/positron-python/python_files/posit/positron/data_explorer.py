@@ -117,7 +117,7 @@ from .inspectors import (
     _format_name_list,
     _format_nbytes,
     _hyperspy_array_axes,
-    _hyperspy_axis_value,
+    _hyperspy_axis_labels,
     _hyperspy_text,
     _hyperspy_title,
     _is_dask_array,
@@ -3341,7 +3341,7 @@ class _ArrayTable:
         """
         if getattr(axis, "is_uniform", True) and axis.scale == 1 and axis.offset == 0:
             return None
-        return [_hyperspy_axis_value(value) for value in axis.axis]
+        return _hyperspy_axis_labels(axis.axis)
 
     def column_label(self, column_index: int) -> str | None:
         """
