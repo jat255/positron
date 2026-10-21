@@ -1085,3 +1085,18 @@ def test_array_view_hyperspy_unavailable_message():
         "Select a slice first, e.g. stack.isig[0]"
     )
     assert _array_view_unavailable_message(s.inav[0], "line") is None
+
+
+def test_array_view_hyperspy_non_uniform_axis(dxf: DataExplorerFixture):
+    hs = pytest.importorskip("hyperspy.api")
+    energy = {"axis": np.array([1.0, 2.0, 4.0]), "name": "Energy", "units": "eV"}
+    position = {"size": 2, "name": "x", "navigate": True}
+    s = hs.signals.Signal1D(np.arange(6.0).reshape(2, 3), axes=[position, energy])
+    dxf.register_table("s", s)
+    # The non-uniform axis labels the columns with its values, even though it starts near 0
+    assert [c["column_name"] for c in dxf.get_schema("s")] == ["1.0", "2.0", "4.0"]
+    assert dxf.get_state("s")["column_axis_name"] == "Energy"
+
+    spectrum = hs.signals.Signal1D(np.arange(3.0), axes=[energy])
+    dxf.register_table("sp", spectrum)
+    assert dxf.get_state("sp")["has_row_labels"]

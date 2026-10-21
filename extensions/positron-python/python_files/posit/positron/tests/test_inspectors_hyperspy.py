@@ -148,3 +148,12 @@ def test_signal_viewer(spectrum_image):
     assert not get_inspector(spectrum_image).has_viewer()
     assert get_inspector(spectrum_image.inav[0]).has_viewer()
     assert get_inspector(spectrum_image.inav[0, 0]).has_viewer()
+
+
+def test_signal_non_uniform_axis():
+    axis = {"axis": np.array([1.0, 2.0, 4.0, 8.0]), "name": "Energy", "units": "eV"}
+    s = hs.signals.Signal1D(np.zeros(4), axes=[axis])
+    ins = get_inspector(ArrayGroup(ArrayGroup.AXES, s))
+    assert get_inspector(ins.get_child(0)).get_display_value()[0] == (
+        "signal, 4 points, 1.0 to 8.0 eV, non-uniform"
+    )
