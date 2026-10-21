@@ -1020,3 +1020,68 @@ def test_array_view_zarr_malformed_dim_names(dxf: DataExplorerFixture, tmp_path,
     dxf.register_table("z", array)
     assert dxf.get_state("z").get("row_axis_name") is None
     assert _column_values(dxf, "z", 1, 3) == ["1.00", "3.00", "5.00"]
+
+
+#
+# HyperSpy signals
+#
+
+
+def _spectrum_image() -> Any:
+    hs = pytest.importorskip("hyperspy.api")
+    s = hs.signals.Signal1D(np.arange(60.0).reshape(3, 4, 5))
+    x, y = s.axes_manager.navigation_axes
+    (energy,) = s.axes_manager.signal_axes
+    x.name, y.name, energy.name = "x", "y", "Energy loss"
+    energy.units = "eV"
+    energy.scale = 0.5
+    energy.offset = 100.0
+    s.metadata.General.title = "EELS SI"
+    return s
+
+
+def test_array_view_hyperspy_line(dxf: DataExplorerFixture):
+    # A line of a spectrum image: rows are the navigation positions, columns the energies.
+    line = _spectrum_image().inav[0]
+    dxf.register_table("line", line)
+    state = dxf.get_state("line")
+    assert (state["row_axis_name"], state["column_axis_name"]) == ("y", "Energy loss")
+    # The y axis is uncalibrated, so the grid numbers the rows.
+    assert not state["has_row_labels"]
+    schema = dxf.get_schema("line")
+    assert [c["column_name"] for c in schema] == ["100.0", "100.5", "101.0", "101.5", "102.0"]
+    assert schema[1]["column_label"] == "Energy loss = 100.5 eV"
+    assert _column_values(dxf, "line", 1, 3) == ["1.00", "21.00", "41.00"]
+
+
+def test_array_view_hyperspy_spectrum(dxf: DataExplorerFixture):
+    spectrum = _spectrum_image().inav[1, 0]
+    dxf.register_table("sp", spectrum)
+    state = dxf.get_state("sp")
+    assert state["row_axis_name"] == "Energy loss"
+    # The energies label the rows.
+    assert state["has_row_labels"]
+    assert [c["column_name"] for c in dxf.get_schema("sp")] == ["EELS SI"]
+    assert _column_values(dxf, "sp", 0, 5) == ["5.00", "6.00", "7.00", "8.00", "9.00"]
+
+
+def test_array_view_hyperspy_lazy_signal(dxf: DataExplorerFixture):
+    line = _spectrum_image().inav[0].as_lazy()
+    assert get_inspector(line).has_viewer()
+    dxf.register_table("lazy", line)
+    assert _column_values(dxf, "lazy", 0, 3) == ["0.00", "20.00", "40.00"]
+
+
+def test_array_view_hyperspy_unavailable_message():
+    s = _spectrum_image()
+    assert _array_view_unavailable_message(s, "s") == (
+        "s has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. s.inav[0]"
+    )
+    hs = pytest.importorskip("hyperspy.api")
+    stack = hs.signals.BaseSignal(np.zeros((2, 3, 4)))
+    assert _array_view_unavailable_message(stack, "stack") == (
+        "stack has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. stack.isig[0]"
+    )
+    assert _array_view_unavailable_message(s.inav[0], "line") is None

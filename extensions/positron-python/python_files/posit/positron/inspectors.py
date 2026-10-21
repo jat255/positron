@@ -1694,6 +1694,7 @@ class ArrayGroup:
     ATTRIBUTES = "Attributes"
     VALUES = "Values"
     DASK_METADATA = "Dask metadata"
+    AXES = "Axes"
 
     def __init__(self, name: str, owner: Any) -> None:
         self.name = name
@@ -1892,7 +1893,15 @@ class ArrayGroupInspector(PositronInspector[ArrayGroup]):
             return list(group.owner.attrs)
         if group.name == ArrayGroup.DASK_METADATA:
             return list(_DASK_METADATA_LABELS)
+        if group.name == ArrayGroup.AXES:
+            # Axes are keyed by their index in HyperSpy's order, since names can be unset or repeat
+            return list(range(len(_hyperspy_axes(group.owner))))
         return []
+
+    def get_display_name(self, key: Any) -> str:
+        if self.value.name == ArrayGroup.AXES and type(key) is int:
+            return _hyperspy_axis_label(_hyperspy_axes(self.value.owner)[key], key)
+        return str(key)
 
     def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
         if self.value.name == ArrayGroup.VALUES:
@@ -1902,6 +1911,8 @@ class ArrayGroupInspector(PositronInspector[ArrayGroup]):
         names = self._names()
         if not names:
             return _NONE_TEXT, False
+        if self.value.name == ArrayGroup.AXES:
+            names = [self.get_display_name(key) for key in names]
         return _format_name_list(names, level=level)
 
     def get_display_type(self) -> str:
@@ -1932,6 +1943,8 @@ class ArrayGroupInspector(PositronInspector[ArrayGroup]):
             return group.owner.attrs[key]
         if group.name == ArrayGroup.DASK_METADATA:
             return MetadataRow(dict(_dask_metadata(group.owner)[1])[key])
+        if group.name == ArrayGroup.AXES and type(key) is int and key in self._names():
+            return MetadataRow(_hyperspy_axis_text(_hyperspy_axes(group.owner)[key]))
         raise KeyError(key)
 
     def is_mutable(self) -> bool:
@@ -2611,6 +2624,228 @@ class H5pyGroupInspector(_StoredGroupInspector):
         return member
 
 
+#
+# HyperSpy
+#
+
+_HYPERSPY_TREE_QNAMES = (
+    "hyperspy.misc._utils.DictionaryTreeBrowser",  # hyperspy 2
+    "hyperspy.misc.utils.DictionaryTreeBrowser",  # hyperspy 1
+)
+
+
+def _is_hyperspy_signal(value: Any) -> bool:
+    """
+    Whether value is a HyperSpy signal.
+
+    That includes every signal class, lazy or not, and those of extensions such as exspy.
+    """
+    return safe_isinstance(value, "hyperspy.signal", "BaseSignal")
+
+
+def _hyperspy_text(value: Any) -> str | None:
+    """A name or units set on a HyperSpy axis, or None when unset."""
+    # traits marks an unset value with its Undefined object, which is not a string.
+    return value if isinstance(value, str) and value else None
+
+
+def _hyperspy_title(signal: Any) -> str | None:
+    """The title of a signal, or None when it has none."""
+    title = signal.metadata.get_item("General.title")
+    return title if isinstance(title, str) and title else None
+
+
+def _hyperspy_axes(signal: Any) -> list[Any]:
+    """The axes of a signal in HyperSpy's order: navigation axes, then signal axes."""
+    axes_manager = signal.axes_manager
+    return [*axes_manager.navigation_axes, *axes_manager.signal_axes]
+
+
+def _hyperspy_axis_label(axis: Any, index: int) -> str:
+    """The name of an axis, or "axis 0" for the unnamed first axis in HyperSpy's order."""
+    return _hyperspy_text(axis.name) or f"axis {index}"
+
+
+def _hyperspy_array_axes(signal: Any) -> list[tuple[str, Any]]:
+    """
+    The label and axis of each dim of a signal's data, in the data's order.
+
+    The data lists each of the navigation and signal axes in reverse, so that the first signal
+    axis is the last dim of the data.
+    """
+    labeled = [
+        (_hyperspy_axis_label(axis, i), axis) for i, axis in enumerate(_hyperspy_axes(signal))
+    ]
+    navigation_dimension = signal.axes_manager.navigation_dimension
+    return [*labeled[:navigation_dimension][::-1], *labeled[navigation_dimension:][::-1]]
+
+
+def _hyperspy_axis_value(value: Any) -> str:
+    """
+    A calibrated axis value, such as "100.5".
+
+    An axis computes its values as offset + scale * index, so they are rounded to 12 significant
+    digits to hide the rounding error of that sum.
+    """
+    return _format_float(_numpy().float64(value), 12)
+
+
+def _hyperspy_axis_text(axis: Any) -> str:
+    """The description of an axis, such as "signal, 2048 points, 100.0 to 1123.5 eV, step 0.5"."""
+    parts = ["navigation" if axis.navigate else "signal", _count(axis.size, "point")]
+    if axis.size > 0:
+        values = axis.axis
+        extent = f"{_hyperspy_axis_value(values[0])} to {_hyperspy_axis_value(values[-1])}"
+        units = _hyperspy_text(axis.units)
+        parts.append(extent if units is None else f"{extent} {units}")
+    # Axes of HyperSpy versions before 1.7 are all uniform and have no is_uniform.
+    if getattr(axis, "is_uniform", True):
+        parts.append(f"step {_hyperspy_axis_value(axis.scale)}")
+    else:
+        parts.append("non-uniform")
+    return ", ".join(parts)
+
+
+def _hyperspy_shape_text(signal: Any) -> str:
+    """The axes of a signal as in HyperSpy's repr, such as "x: 64 x y: 64 | E: 2048"."""
+
+    def part(axes: list[tuple[int, Any]]) -> str:
+        return " x ".join(
+            f"{name}: {axis.size}" if (name := _hyperspy_text(axis.name)) else str(axis.size)
+            for _, axis in axes
+        )
+
+    axes = list(enumerate(_hyperspy_axes(signal)))
+    navigation_dimension = signal.axes_manager.navigation_dimension
+    navigation = part(axes[:navigation_dimension])
+    sig = part(axes[navigation_dimension:])
+    return f"{navigation} | {sig}".strip()
+
+
+class HyperspySignalInspector(PositronInspector[Any]):
+    """
+    A HyperSpy signal of any signal class.
+
+    Signals are mutable, and copying one would copy its data, so the Variables pane summarizes
+    them again after every execution. That reads only the axes and metadata; a lazy signal is not
+    computed.
+    """
+
+    TITLE = "Title"
+    AXES = "Axes"
+    METADATA = "Metadata"
+    ORIGINAL_METADATA = "Original metadata"
+    DATA = "Data"
+
+    def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
+        signal = self.value
+        cls = type(signal)
+        library = cls.__module__.split(".", 1)[0]
+        text = f"[{_hyperspy_shape_text(signal)}] {library}.{cls.__name__}"
+        return _maybe_truncate_string(text, level=level)[0], True
+
+    def get_display_type(self) -> str:
+        # HyperSpy's notation for the navigation and signal shapes, such as "(64, 64|2048)"
+        axes_manager = self.value.axes_manager
+        navigation = ", ".join(str(size) for size in axes_manager.navigation_shape)
+        sig = ", ".join(str(size) for size in axes_manager.signal_shape)
+        return f"{type(self.value).__name__} ({navigation}|{sig}) {self.value.data.dtype}"
+
+    def get_kind(self) -> str:
+        return "table"
+
+    def has_viewer(self) -> bool:
+        return _has_array_viewer(self.value)
+
+    def get_length(self) -> int:
+        # The Variables pane treats the length as the child count, and adds a "more values"
+        # row when it is larger than the number of children it receives.
+        return len(self.get_children())
+
+    def get_size(self) -> int:
+        data = self.value.data
+        if _is_dask_array(data):
+            return _dask_nbytes(data) or 0
+        return int(getattr(data, "nbytes", 0))
+
+    def has_children(self) -> bool:
+        return True
+
+    def get_children(self) -> list[str]:
+        children = [self.AXES, self.METADATA]
+        if _hyperspy_title(self.value) is not None:
+            children.insert(0, self.TITLE)
+        if self.value.original_metadata.keys():
+            children.append(self.ORIGINAL_METADATA)
+        children.append(self.DATA)
+        return children
+
+    def has_child(self, key: Any) -> bool:
+        return key in self.get_children()
+
+    def get_child(self, key: Any) -> Any:
+        signal = self.value
+        if key == self.TITLE:
+            return MetadataRow(_hyperspy_title(signal) or "")
+        if key == self.AXES:
+            return ArrayGroup(ArrayGroup.AXES, signal)
+        if key == self.METADATA:
+            return signal.metadata
+        if key == self.ORIGINAL_METADATA:
+            return signal.original_metadata
+        if key == self.DATA:
+            return signal.data
+        raise KeyError(key)
+
+    def to_plaintext(self) -> str:
+        return repr(self.value)
+
+
+class HyperspyTreeInspector(PositronInspector[Any]):
+    """
+    The metadata tree of a HyperSpy signal, such as `s.metadata`.
+
+    Its keys omit the internal `_HyperSpy` node, as HyperSpy's own listing does.
+    """
+
+    CLASS_QNAME = _HYPERSPY_TREE_QNAMES
+
+    def _keys(self) -> list[str]:
+        return list(self.value.keys())
+
+    def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
+        keys = self._keys()
+        if not keys:
+            return _NONE_TEXT, False
+        return _format_name_list(keys, level=level)
+
+    def get_display_type(self) -> str:
+        return f"{type(self.value).__name__} [{len(self._keys())}]"
+
+    def get_kind(self) -> str:
+        return "map"
+
+    def get_length(self) -> int:
+        return len(self._keys())
+
+    def has_children(self) -> bool:
+        return self.get_length() > 0
+
+    def get_children(self) -> list[str]:
+        return self._keys()
+
+    def has_child(self, key: Any) -> bool:
+        return key in self._keys()
+
+    def get_child(self, key: Any) -> Any:
+        if key not in self._keys():
+            raise KeyError(key)
+        return self.value[key]
+
+    def to_plaintext(self) -> str:
+        return repr(self.value)
+
+
 INSPECTOR_CLASSES: dict[str, type[PositronInspector]] = {
     # xarray inspectors and their child rows
     **dict.fromkeys(XarrayDatasetInspector.CLASS_QNAME, XarrayDatasetInspector),
@@ -2622,6 +2857,9 @@ INSPECTOR_CLASSES: dict[str, type[PositronInspector]] = {
     **dict.fromkeys(ZarrGroupInspector.CLASS_QNAME, ZarrGroupInspector),
     **dict.fromkeys(H5pyDatasetInspector.CLASS_QNAME, H5pyDatasetInspector),
     **dict.fromkeys(H5pyGroupInspector.CLASS_QNAME, H5pyGroupInspector),
+    # HyperSpy metadata trees. Signals have many classes, so get_inspector matches them by base
+    # class instead.
+    **dict.fromkeys(HyperspyTreeInspector.CLASS_QNAME, HyperspyTreeInspector),
     get_qualname(MetadataRow): MetadataRowInspector,
     get_qualname(ArrayGroup): ArrayGroupInspector,
     # Geopandas inspectors (before pandas to take precedence)
@@ -2682,6 +2920,10 @@ def get_inspector(value: T) -> PositronInspector[T]:
     # intended for Mapping types like dict.
     if inspector_cls is MapInspector and not isinstance(value, Mapping):
         inspector_cls = None
+
+    if inspector_cls is None and _is_hyperspy_signal(value):
+        # HyperSpy and its extensions define many signal classes, all subclasses of BaseSignal
+        inspector_cls = HyperspySignalInspector
 
     if inspector_cls is None:
         # Otherwise, look for an inspector by kind
