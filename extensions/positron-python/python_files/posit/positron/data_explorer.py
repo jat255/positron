@@ -3330,7 +3330,12 @@ class _ArrayTable:
             # Columns need names, so an uncalibrated axis uses index positions.
             columns = cls._hyperspy_labels(column_axis) or [str(i) for i in range(column_axis.size)]
             label_units = _hyperspy_text(column_axis.units)
-        return cls(values, columns, row_labels, dims, name, None, label_units, dims[0])
+        # The corner names each axis with its units. An uncalibrated axis with units has a step of
+        # 1 from 0, so the grid's row numbers are positions in those units.
+        row_axis_units = _hyperspy_text(axes[0][1].units)
+        return cls(
+            values, columns, row_labels, dims, name, None, label_units, dims[0], row_axis_units
+        )
 
     @staticmethod
     def _hyperspy_labels(axis: Any) -> list[str] | None:

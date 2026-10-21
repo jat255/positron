@@ -1045,7 +1045,7 @@ def test_array_view_hyperspy_line(dxf: DataExplorerFixture):
     line = _spectrum_image().inav[0]
     dxf.register_table("line", line)
     state = dxf.get_state("line")
-    assert (state["row_axis_name"], state["column_axis_name"]) == ("y", "Energy loss")
+    assert (state["row_axis_name"], state["column_axis_name"]) == ("y", "Energy loss (eV)")
     # The y axis is uncalibrated, so the grid numbers the rows.
     assert not state["has_row_labels"]
     schema = dxf.get_schema("line")
@@ -1058,7 +1058,7 @@ def test_array_view_hyperspy_spectrum(dxf: DataExplorerFixture):
     spectrum = _spectrum_image().inav[1, 0]
     dxf.register_table("sp", spectrum)
     state = dxf.get_state("sp")
-    assert state["row_axis_name"] == "Energy loss"
+    assert state["row_axis_name"] == "Energy loss (eV)"
     # The energies label the rows.
     assert _row_labels(dxf, "sp", 3) == ["100.0", "100.5", "101.0"]
     assert [c["column_name"] for c in dxf.get_schema("sp")] == ["EELS SI"]
@@ -1095,7 +1095,7 @@ def test_array_view_hyperspy_non_uniform_axis(dxf: DataExplorerFixture):
     dxf.register_table("s", s)
     # The non-uniform axis labels the columns with its values, even though it starts near 0
     assert [c["column_name"] for c in dxf.get_schema("s")] == ["1.0", "2.0", "4.0"]
-    assert dxf.get_state("s")["column_axis_name"] == "Energy"
+    assert dxf.get_state("s")["column_axis_name"] == "Energy (eV)"
 
     spectrum = hs.signals.Signal1D(np.arange(3.0), axes=[energy])
     dxf.register_table("sp", spectrum)
