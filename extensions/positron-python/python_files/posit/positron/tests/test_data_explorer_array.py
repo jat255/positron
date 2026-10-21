@@ -106,6 +106,17 @@ def test_array_view_corner_names_units(dxf: DataExplorerFixture):
     assert state["display_name"] == "sst (lat, lon)"
 
 
+def test_array_view_index_variable_units(dxf: DataExplorerFixture):
+    ds = make_dataset()
+    ds.lat.attrs["units"] = "degrees_north"
+    dxf.register_table("lat", ds.variables["lat"])
+    assert dxf.get_state("lat")["row_axis_name"] == "lat (degrees_north)"
+    # A Variable that is not a coordinate has no row axis units.
+    ds.sst.attrs["units"] = "degC"
+    dxf.register_table("v", ds.variables["sst"].isel(time=0))
+    assert dxf.get_state("v")["row_axis_name"] == "lat"
+
+
 def test_array_view_dataarray_2d_without_coordinates(dxf: DataExplorerFixture):
     xr = pytest.importorskip("xarray")
     da = xr.DataArray(np.zeros((2, 3)), dims=("y", "x"), name="z")

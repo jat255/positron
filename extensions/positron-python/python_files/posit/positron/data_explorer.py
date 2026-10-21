@@ -3166,6 +3166,10 @@ class _ArrayTable:
         row_axis_name = None
         row_axis_units = None
         xr_module = sys.modules.get("xarray")
+        if xr_module is not None and isinstance(value, xr_module.IndexVariable):
+            # An IndexVariable holds the values of its dim's coordinate, so its units are those
+            # of the row axis.
+            row_axis_units = cls._units(value)
         if xr_module is not None and isinstance(value, xr_module.Variable):
             # A DataArray without coordinates or a name shows a Variable's dims and attrs. It
             # wraps the Variable's data without loading it. The base Variable of an
