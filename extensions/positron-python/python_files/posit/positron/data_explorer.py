@@ -118,6 +118,9 @@ from .inspectors import (
     _format_nbytes,
     _is_dask_array,
     _is_own_coordinate,
+    _is_stored_array,
+    _stored_array_dims,
+    _stored_array_name,
 )
 from .positron_comm import CommMessage, PositronComm
 from .third_party import is_ibis, is_pandas, is_polars
@@ -2938,22 +2941,29 @@ class IbisView(PandasView):
 
 
 # ----------------------------------------------------------------------
-# Array Data Explorer RPC implementations for 1-D and 2-D numpy, xarray, and dask arrays
+# Array Data Explorer RPC implementations for 1-D and 2-D numpy, xarray, dask, zarr, and h5py
+# arrays
 
 # Opening an array view loads its values into memory. That computes a dask-backed array and reads
-# a lazily indexed one (for example a variable opened from a file without chunks). Larger arrays
-# that are not already in memory have no Data Explorer view.
+# a lazily indexed one (for example a variable opened from a file without chunks), a zarr array, or
+# an h5py dataset. Larger arrays that are not already in memory have no Data Explorer view.
 ARRAY_VIEW_MAX_LAZY_BYTES = 100 * 1024 * 1024
 
 
 def _is_array(value: Any) -> bool:
-    """Whether value is a numpy array, xarray DataArray or Variable, or dask array."""
+    """
+    Whether value is an array that an array view can show, given 1 or 2 dims.
+
+    That is a numpy array, xarray DataArray or Variable, dask array, zarr array, or h5py dataset of
+    an open file.
+    """
     np_module = sys.modules.get("numpy")
     xr_module = sys.modules.get("xarray")
     return (
         (np_module is not None and isinstance(value, np_module.ndarray))
         or (xr_module is not None and isinstance(value, (xr_module.DataArray, xr_module.Variable)))
         or _is_dask_array(value)
+        or _is_stored_array(value)
     )
 
 
@@ -2967,6 +2977,8 @@ def _array_lazy_nbytes(value: Any) -> int | None:
     np_module = sys.modules.get("numpy")
     if np_module is not None and isinstance(value, np_module.ndarray):
         return 0
+    if _is_stored_array(value):
+        return int(value.nbytes)
     dask_sizes = [_dask_nbytes(array) for _, array in _dask_variables(value)]
     if dask_sizes:
         if None in dask_sizes:
@@ -2990,7 +3002,7 @@ def _is_lazy_object_array(value: Any, nbytes: int | None) -> bool:
 
 
 def _is_viewable_array(value: Any) -> bool:
-    """Whether value is a 1-D or 2-D numpy array, xarray DataArray or Variable, or dask array."""
+    """Whether value is one of the arrays that _is_array accepts, with 1 or 2 dims."""
     if not _is_array(value) or value.ndim not in (1, 2):
         return False
     if value.dtype.names is not None:
@@ -3042,16 +3054,22 @@ def _array_view_unavailable_message(value: Any, expr: str) -> str | None:
             return (
                 f"{expr} has a shape that is not known until it is computed. Call .compute() first."
             )
+        # A zarr array or an h5py dataset has no .compute(). Indexing it reads values into memory.
+        stored = _is_stored_array(value)
         if _is_lazy_object_array(value, nbytes):
+            load = "Read it into memory first." if stored else "Call .compute() first."
             return (
                 f"{expr} has object dtype and is not in memory, so the memory it needs is not "
-                "known until it is loaded. Call .compute() first."
+                f"known until it is loaded. {load}"
             )
         if nbytes > ARRAY_VIEW_MAX_LAZY_BYTES:
+            smaller = "Select a smaller slice first."
+            if not stored:
+                smaller = "Select a smaller slice or call .compute() first."
             return (
                 f"{expr} is {_format_nbytes(nbytes)} (not in memory), over the "
                 f"{_format_nbytes(ARRAY_VIEW_MAX_LAZY_BYTES)} limit for the Data Explorer. "
-                "Select a smaller slice or call .compute() first."
+                f"{smaller}"
             )
     return None
 
@@ -3166,6 +3184,12 @@ class _ArrayTable:
         row_axis_name = None
         row_axis_units = None
         xr_module = sys.modules.get("xarray")
+        if _is_stored_array(value):
+            stored = cls._from_stored_array(value)
+            if stored is not None:
+                return stored
+            # Without a name for every dim, the values open like a numpy array.
+            value = value[...]
         if xr_module is not None and isinstance(value, xr_module.IndexVariable):
             # An IndexVariable holds the values of its dim's coordinate, so its units are those
             # of the row axis.
@@ -3229,6 +3253,32 @@ class _ArrayTable:
             row_axis_name,
             row_axis_units,
         )
+
+    @classmethod
+    def _from_stored_array(cls, value: Any) -> _ArrayTable | None:
+        """
+        The table of a zarr array or an h5py dataset whose store names every dim, else None.
+
+        It reads every value, which the size limit bounds. The table is that of an xarray
+        Variable with the same dims, without importing xarray: the grid numbers the rows and
+        columns, and the corner names the dims.
+        """
+        import numpy as np
+
+        stored_dims = _stored_array_dims(value)
+        if stored_dims is None or len(set(stored_dims)) != len(stored_dims):
+            return None
+        dims = tuple(str(dim) for dim in stored_dims)
+        name = _stored_array_name(value)
+        values = np.asarray(value[...])
+        if values.ndim == 1:
+            columns = ["0" if name is None else name]
+            values = values.reshape(-1, 1)
+        else:
+            columns = [str(i) for i in range(values.shape[1])]
+        # A 1-D dimension scale (a coordinate) names its dim in its single column already.
+        row_axis_name = None if len(dims) == 1 and name == dims[0] else dims[0]
+        return cls(values, columns, None, dims, name, row_axis_name=row_axis_name)
 
     def column_label(self, column_index: int) -> str | None:
         """

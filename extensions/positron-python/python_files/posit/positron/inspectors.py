@@ -2220,6 +2220,58 @@ def _count(n: int, noun: str) -> str:
     return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
 
 
+def _zarr_dims(array: Any) -> Sequence[Any] | None:
+    """The dim names of a zarr array, or None when the store does not name every dim."""
+    # zarr format 3 names dims in the array metadata. xarray names them in an attribute when it
+    # writes zarr format 2.
+    names = getattr(getattr(array, "metadata", None), "dimension_names", None)
+    if names is None:
+        names = array.attrs.get("_ARRAY_DIMENSIONS")
+    if names is None or any(name is None for name in names):
+        return None
+    return names
+
+
+def _h5py_dims(dataset: Any) -> Sequence[Any] | None:
+    """The dim names of an h5py dataset, or None when the file does not name every dim."""
+    # An anonymous dataset, not linked into the file, has no name.
+    if dataset.name and dataset.ndim == 1 and sys.modules["h5py"].h5ds.is_scale(dataset.id):
+        # A 1-D dimension scale, such as a netCDF4 coordinate, names the dim it measures.
+        return [dataset.name.rsplit("/", 1)[-1]]
+    names = []
+    for dim in dataset.dims:
+        # A dim is named by its label, or else by its dimension scale, as in netCDF4 files.
+        scales = dim.values()
+        name = dim.label or (scales[0].name.rsplit("/", 1)[-1] if scales else None)
+        if not name:
+            return None
+        names.append(name)
+    return names
+
+
+def _is_stored_array(value: Any) -> bool:
+    """Whether value is a zarr array or an h5py dataset of an open file."""
+    qualname = get_qualname(type(value))
+    if qualname in _ZARR_ARRAY_QNAMES:
+        return True
+    # A dataset of a closed file is falsy.
+    return qualname in _H5PY_DATASET_QNAMES and bool(value)
+
+
+def _stored_array_dims(value: Any) -> Sequence[Any] | None:
+    """The dim names of a zarr array or an h5py dataset, or None when not every dim is named."""
+    if get_qualname(type(value)) in _ZARR_ARRAY_QNAMES:
+        return _zarr_dims(value)
+    return _h5py_dims(value)
+
+
+def _stored_array_name(value: Any) -> str | None:
+    """The last part of the path of a zarr array or an h5py dataset, or None when it has none."""
+    # An anonymous h5py dataset has no name, and an array at the root of a store has no last part.
+    basename = (value.name or "").rsplit("/", 1)[-1]
+    return basename or None
+
+
 class _StoredArrayInspector(PositronInspector[Any], ABC):
     """
     Shared behavior of an array in a zarr store or an HDF5 file.
@@ -2259,6 +2311,9 @@ class _StoredArrayInspector(PositronInspector[Any], ABC):
 
     def get_kind(self) -> str:
         return "table"
+
+    def has_viewer(self) -> bool:
+        return _has_array_viewer(self.value)
 
     def get_length(self) -> int:
         # The Variables pane treats the length as the child count, and adds a "more values"
@@ -2369,15 +2424,7 @@ class ZarrArrayInspector(_StoredArrayInspector):
     STORE = "Store"
 
     def _dims(self) -> Sequence[Any] | None:
-        array = self.value
-        # zarr format 3 names dims in the array metadata. xarray names them in an attribute when
-        # it writes zarr format 2.
-        names = getattr(getattr(array, "metadata", None), "dimension_names", None)
-        if names is None:
-            names = array.attrs.get("_ARRAY_DIMENSIONS")
-        if names is None or any(name is None for name in names):
-            return None
-        return names
+        return _zarr_dims(self.value)
 
     def _metadata(self) -> dict[str, str]:
         array = self.value
@@ -2429,20 +2476,7 @@ class H5pyDatasetInspector(_StoredArrayInspector):
         return bool(self.value)
 
     def _dims(self) -> Sequence[Any] | None:
-        dataset = self.value
-        # An anonymous dataset, not linked into the file, has no name.
-        if dataset.name and dataset.ndim == 1 and sys.modules["h5py"].h5ds.is_scale(dataset.id):
-            # A 1-D dimension scale, such as a netCDF4 coordinate, names the dim it measures.
-            return [dataset.name.rsplit("/", 1)[-1]]
-        names = []
-        for dim in dataset.dims:
-            # A dim is named by its label, or else by its dimension scale, as in netCDF4 files.
-            scales = dim.values()
-            name = dim.label or (scales[0].name.rsplit("/", 1)[-1] if scales else None)
-            if not name:
-                return None
-            names.append(name)
-        return names
+        return _h5py_dims(self.value)
 
     def _metadata(self) -> dict[str, str]:
         dataset = self.value

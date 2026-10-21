@@ -926,3 +926,88 @@ def test_array_view_unavailable_message_variable():
         "v has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
         "Select a slice first, e.g. v.isel(time=0)"
     )
+
+
+#
+# zarr arrays and h5py datasets
+#
+
+
+def _zarr_array(tmp_path, values: np.ndarray, dims: list[str] | None) -> Any:
+    zarr = pytest.importorskip("zarr")
+    root = zarr.open_group(str(tmp_path / "store.zarr"), mode="w")
+    if hasattr(root, "create_array"):
+        array = root.create_array("sst", shape=values.shape, dtype=values.dtype)
+    else:
+        array = root.create_dataset("sst", shape=values.shape, dtype=values.dtype)
+    array[...] = values
+    if dims is not None:
+        # The attribute xarray writes, which zarr 2 and zarr 3 both read
+        array.attrs["_ARRAY_DIMENSIONS"] = dims
+    return array
+
+
+def test_array_view_zarr_2d(dxf: DataExplorerFixture, tmp_path):
+    array = _zarr_array(tmp_path, np.arange(12.0).reshape(3, 4), ["lat", "lon"])
+    assert get_inspector(array).has_viewer()
+    dxf.register_table("z", array)
+    state = dxf.get_state("z")
+    assert state["display_name"] == "z (lat, lon)"
+    assert (state["row_axis_name"], state["column_axis_name"]) == ("lat", "lon")
+    assert not state["has_row_labels"]
+    assert [c["column_name"] for c in dxf.get_schema("z")] == ["0", "1", "2", "3"]
+    assert _column_values(dxf, "z", 1, 3) == ["1.00", "5.00", "9.00"]
+
+
+def test_array_view_zarr_without_dims(dxf: DataExplorerFixture, tmp_path):
+    array = _zarr_array(tmp_path, np.arange(6.0).reshape(3, 2), None)
+    dxf.register_table("z", array)
+    assert dxf.get_state("z").get("row_axis_name") is None
+    assert _column_values(dxf, "z", 1, 3) == ["1.00", "3.00", "5.00"]
+
+
+def test_array_view_h5py(dxf: DataExplorerFixture, tmp_path):
+    h5py = pytest.importorskip("h5py")
+    with h5py.File(tmp_path / "data.h5", "w") as f:
+        grid = f.create_dataset("grid", data=np.arange(12.0).reshape(3, 4))
+        grid.dims[0].label = "lat"
+        grid.dims[1].label = "lon"
+        f.create_dataset("plain", data=np.arange(3))
+        time = f.create_dataset("time", data=np.arange(3.0))
+        time.make_scale("time")
+    with h5py.File(tmp_path / "data.h5", "r") as f:
+        assert get_inspector(f["grid"]).has_viewer()
+        dxf.register_table("g", f["grid"])
+        state = dxf.get_state("g")
+        assert (state["row_axis_name"], state["column_axis_name"]) == ("lat", "lon")
+        assert _column_values(dxf, "g", 2, 3) == ["2.00", "6.00", "10.00"]
+
+        # Without dim names, the dataset opens like a numpy array.
+        dxf.register_table("p", f["plain"])
+        assert dxf.get_state("p").get("row_axis_name") is None
+        assert _column_values(dxf, "p", 0, 3) == ["0", "1", "2"]
+        # A dimension scale names its dim in its column, so the corner leaves the rows unnamed.
+        dxf.register_table("t", f["time"])
+        assert dxf.get_state("t").get("row_axis_name") is None
+        assert [c["column_name"] for c in dxf.get_schema("t")] == ["time"]
+        dataset = f["plain"]
+    # A dataset of a closed file has no view.
+    assert not _value_type_is_supported(dataset)
+
+
+def test_stored_array_viewer_respects_size_limit(tmp_path):
+    h5py = pytest.importorskip("h5py")
+    with h5py.File(tmp_path / "big.h5", "w") as f:
+        # Chunked datasets take no space until written.
+        big = f.create_dataset("big", shape=(40000, 40000), dtype="f4", chunks=(1000, 1000))
+        cube = f.create_dataset("cube", shape=(2, 3, 4), dtype="f4")
+        assert not _value_type_is_supported(big)
+        assert not get_inspector(big).has_viewer()
+        assert _array_view_unavailable_message(big, "f['big']") == (
+            "f['big'] is 6.0 GiB (not in memory), over the 100.0 MiB limit for the Data "
+            "Explorer. Select a smaller slice first."
+        )
+        assert _array_view_unavailable_message(cube, "cube") == (
+            "cube has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+            "Select a slice first, e.g. cube[0]"
+        )
