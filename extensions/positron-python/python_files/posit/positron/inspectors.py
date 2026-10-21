@@ -754,16 +754,17 @@ class NumpyNdarrayInspector(_BaseArrayInspector["np.ndarray"]):
     def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
         if level >= len(MAX_ITEMS_BY_LEVEL):
             return f"numpy.array({ELLIPSIS})", True
-        return (
-            _numpy().array2string(
-                self.value,
-                max_line_width=ARRAY_MAX_LINE_WIDTH,
-                threshold=ARRAY_THRESHOLD,
-                edgeitems=ARRAY_EDGEITEMS,
-                separator=",",
-            ),
-            True,
+        # Items are formatted as in the xarray values preview, without padding to a common width,
+        # and the lines of a 2-D array are joined, since the Variables pane shows one line.
+        text = _numpy().array2string(
+            self.value,
+            max_line_width=ARRAY_MAX_LINE_WIDTH,
+            threshold=ARRAY_THRESHOLD,
+            edgeitems=ARRAY_EDGEITEMS,
+            separator=", ",
+            formatter={"all": _preview_item_formatter(self.value.dtype)},
         )
+        return " ".join(text.split()), True
 
     def equals(self, value: np.ndarray) -> bool:
         return _numpy().array_equal(self.value, value)
