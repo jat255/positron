@@ -3131,6 +3131,7 @@ class _ArrayTable:
         mask: np.ndarray | None = None,
         label_units: str | None = None,
         row_axis_name: str | None = None,
+        row_axis_units: str | None = None,
     ):
         self.values = values
         # 2-D boolean array, True where a cell is masked (missing), or None
@@ -3145,6 +3146,8 @@ class _ArrayTable:
         self.label_units = label_units
         # The dim the rows run along, named in the grid corner, or None
         self.row_axis_name = row_axis_name
+        # The `units` attr of the row dim's coordinate, shown after the row axis name, or None
+        self.row_axis_units = row_axis_units
 
     def __len__(self) -> int:
         return self.shape[0]
@@ -3161,6 +3164,7 @@ class _ArrayTable:
         mask = None
         label_units = None
         row_axis_name = None
+        row_axis_units = None
         xr_module = sys.modules.get("xarray")
         if xr_module is not None and isinstance(value, xr_module.Variable):
             # A DataArray without coordinates or a name shows a Variable's dims and attrs. It
@@ -3184,6 +3188,7 @@ class _ArrayTable:
                 row_labels = None
             else:
                 row_labels = cls._dim_labels(value, row_dim)
+                row_axis_units = cls._units(value.coords[row_dim])
             if value.ndim == 1:
                 columns = ["0" if name is None else name]
             else:
@@ -3209,7 +3214,17 @@ class _ArrayTable:
             values = values.reshape(-1, 1)
             if mask is not None:
                 mask = mask.reshape(-1, 1)
-        return cls(values, columns, row_labels, dims, name, mask, label_units, row_axis_name)
+        return cls(
+            values,
+            columns,
+            row_labels,
+            dims,
+            name,
+            mask,
+            label_units,
+            row_axis_name,
+            row_axis_units,
+        )
 
     def column_label(self, column_index: int) -> str | None:
         """
@@ -3245,6 +3260,13 @@ class _ArrayTable:
             to_str = _datetime64_formatter() if labels.dtype.kind == "M" else str
             return [to_str(label) for label in labels]
         return [str(i) for i in range(data_array.sizes[dim])]
+
+
+def _axis_name_with_units(name: str | None, units: str | None) -> str | None:
+    """An axis name for the grid corner, followed by its units when known, as in "lon (degrees_east)"."""
+    if name is None or units is None:
+        return name
+    return f"{name} ({units})"
 
 
 _ARRAY_DTYPE_KIND_DISPLAY = MappingProxyType(
@@ -3492,16 +3514,19 @@ class ArrayView(DataExplorerTableView):
         dims = self.table.dims
         if dims:
             state.display_name = f"{self.state.name} ({', '.join(dims)})"
-            # The grid corner names the dims that index its rows and (for 2-D) its columns.
-            state.row_axis_name = self.table.row_axis_name
+            # The grid corner names the dims that index its rows and (for 2-D) its columns, each
+            # followed by the units of its coordinate, as in "lat (degrees_north)".
+            state.row_axis_name = _axis_name_with_units(
+                self.table.row_axis_name, self.table.row_axis_units
+            )
             if len(dims) > 1:
-                state.column_axis_name = dims[1]
+                state.column_axis_name = _axis_name_with_units(dims[1], self.table.label_units)
         return state
 
     def get_updated_state(self, new_table) -> StateUpdate:
         # Arrays have no sort keys or filters to carry over. The schema is unchanged when the
         # shape, dtype, column names, row labels, dims (which the title names), and the units in
-        # the column labels all match, so only the data needs a refresh.
+        # the column labels and the grid corner all match, so only the data needs a refresh.
         new_table = _ArrayTable.from_value(new_table)
         old_table = self.table
         schema_updated = (
@@ -3511,6 +3536,7 @@ class ArrayView(DataExplorerTableView):
             or new_table.row_labels != old_table.row_labels
             or new_table.dims != old_table.dims
             or new_table.label_units != old_table.label_units
+            or new_table.row_axis_units != old_table.row_axis_units
         )
         return schema_updated, DataExplorerState(self.state.name)
 

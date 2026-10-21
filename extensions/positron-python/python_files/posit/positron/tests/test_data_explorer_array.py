@@ -92,6 +92,20 @@ def test_array_view_dataarray_2d(dxf: DataExplorerFixture):
     assert _column_values(dxf, "sst", 1, num_rows) == ["1.00", "6.00", "11.00"]
 
 
+def test_array_view_corner_names_units(dxf: DataExplorerFixture):
+    da = make_dataset()["sst"].isel(time=0)
+    da.lat.attrs["units"] = "degrees_north"
+    da.lon.attrs["units"] = "degrees_east"
+    dxf.register_table("sst", da)
+    state = dxf.get_state("sst")
+    assert (state["row_axis_name"], state["column_axis_name"]) == (
+        "lat (degrees_north)",
+        "lon (degrees_east)",
+    )
+    # The title names the dims alone.
+    assert state["display_name"] == "sst (lat, lon)"
+
+
 def test_array_view_dataarray_2d_without_coordinates(dxf: DataExplorerFixture):
     xr = pytest.importorskip("xarray")
     da = xr.DataArray(np.zeros((2, 3)), dims=("y", "x"), name="z")
