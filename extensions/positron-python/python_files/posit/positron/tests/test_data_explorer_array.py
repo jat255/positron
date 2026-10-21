@@ -1060,7 +1060,7 @@ def test_array_view_hyperspy_spectrum(dxf: DataExplorerFixture):
     state = dxf.get_state("sp")
     assert state["row_axis_name"] == "Energy loss"
     # The energies label the rows.
-    assert state["has_row_labels"]
+    assert _row_labels(dxf, "sp", 3) == ["100.0", "100.5", "101.0"]
     assert [c["column_name"] for c in dxf.get_schema("sp")] == ["EELS SI"]
     assert _column_values(dxf, "sp", 0, 5) == ["5.00", "6.00", "7.00", "8.00", "9.00"]
 
@@ -1099,4 +1099,4 @@ def test_array_view_hyperspy_non_uniform_axis(dxf: DataExplorerFixture):
 
     spectrum = hs.signals.Signal1D(np.arange(3.0), axes=[energy])
     dxf.register_table("sp", spectrum)
-    assert dxf.get_state("sp")["has_row_labels"]
+    assert _row_labels(dxf, "sp", 3) == ["1.0", "2.0", "4.0"]
