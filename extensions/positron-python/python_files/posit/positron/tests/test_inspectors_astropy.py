@@ -144,6 +144,8 @@ def test_inspect_plain_nddata():
     assert _display_names(nddata) == ["Data"]
     big_endian = CCDData(np.zeros(2, dtype=">i2"), unit="adu")
     assert get_inspector(big_endian).get_display_type() == "CCDData [2] int16"
+    records = NDData(np.zeros(2, dtype=[("a", ">i4"), ("b", "<f8")]))
+    assert get_inspector(records).get_display_type() == ("NDData [2] [('a', '<i4'), ('b', '<f8')]")
     assert not get_inspector(nddata).has_viewer()
 
 

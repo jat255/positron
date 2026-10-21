@@ -2993,9 +2993,9 @@ class AstropyNDDataInspector(PositronInspector[Any]):
     def get_display_type(self) -> str:
         data = self.value.data
         shape = "x".join(str(size) for size in data.shape) if data.shape else "scalar"
-        # The dtype's name leaves out the byte order, as in "int16" for the big-endian ">i2" of
-        # FITS data.
-        return f"{type(self.value).__name__} [{shape}] {data.dtype.name}"
+        # The dtype in native byte order reads "int16" for the big-endian ">i2" of FITS data, and
+        # keeps the fields of a structured dtype.
+        return f"{type(self.value).__name__} [{shape}] {data.dtype.newbyteorder('=')}"
 
     def get_kind(self) -> str:
         return "table"
