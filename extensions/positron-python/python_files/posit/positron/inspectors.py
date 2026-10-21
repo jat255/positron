@@ -2861,6 +2861,456 @@ class HyperspyTreeInspector(PositronInspector[Any]):
         return repr(self.value)
 
 
+#
+# astropy
+#
+
+_FITS_HEADER_QNAMES = ("astropy.io.fits.header.Header",)
+_FITS_HDULIST_QNAMES = ("astropy.io.fits.hdu.hdulist.HDUList",)
+
+# The numpy dtype of each FITS BITPIX value
+_FITS_BITPIX_DTYPES = types.MappingProxyType(
+    {8: "uint8", 16: "int16", 32: "int32", 64: "int64", -32: "float32", -64: "float64"}
+)
+
+
+def _is_quantity(value: Any) -> bool:
+    """Whether value is an astropy Quantity, of any Quantity class, such as Angle or Distance."""
+    return safe_isinstance(value, "astropy.units", "Quantity")
+
+
+def _is_nddata(value: Any) -> bool:
+    """Whether value is an astropy NDData, of any class, such as CCDData."""
+    return safe_isinstance(value, "astropy.nddata", "NDData")
+
+
+def _is_fits_hdu(value: Any) -> bool:
+    """Whether value is a FITS HDU of any kind, image or table."""
+    return safe_isinstance(value, "astropy.io.fits.hdu.base", "_BaseHDU")
+
+
+def _is_fits_image_hdu(value: Any) -> bool:
+    """Whether value is a FITS image HDU, such as a PrimaryHDU or an ImageHDU."""
+    return safe_isinstance(value, "astropy.io.fits.hdu.image", "_ImageBaseHDU")
+
+
+def _unit_text(unit: Any) -> str | None:
+    """A unit as astropy writes it, such as "km / s", or None for no unit or a dimensionless one."""
+    if unit is None:
+        return None
+    return unit.to_string() or None
+
+
+def _library_name(value: Any) -> str:
+    """The class of value prefixed with its top-level package, such as "astropy.CCDData"."""
+    cls = type(value)
+    return f"{cls.__module__.split('.', 1)[0]}.{cls.__name__}"
+
+
+class AstropyQuantityInspector(NumpyNdarrayInspector):
+    """An astropy Quantity, of any Quantity class: a numpy array with a unit."""
+
+    def _values(self) -> np.ndarray:
+        # The plain array. Quantity.value is a numpy scalar for a scalar Quantity.
+        return self.value.view(_numpy().ndarray)
+
+    def _unit_text(self) -> str | None:
+        return _unit_text(cast("Any", self.value).unit)
+
+    def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
+        text, is_truncated = NumpyNdarrayInspector(self._values()).get_display_value(level=level)
+        unit = self._unit_text()
+        return (text if unit is None else f"{text} {unit}"), is_truncated
+
+    def get_display_type(self) -> str:
+        values = self._values()
+        text = f"{type(self.value).__name__} {values.dtype}"
+        if values.ndim == 1:
+            text += f" ({values.shape[0]})"
+        elif values.ndim > 1:
+            text += f" {values.shape}"
+        unit = self._unit_text()
+        return text if unit is None else f"{text} [{unit}]"
+
+    def equals(self, value: Any) -> bool:
+        # Compared as Any, since type checkers know a Quantity only as the ndarray it subclasses
+        old: Any = self.value
+        return (
+            type(value) is type(old)
+            and value.unit == old.unit
+            and _numpy().array_equal(self._values(), value.view(_numpy().ndarray))
+        )
+
+
+def _wcs_text(wcs: Any) -> str:
+    """
+    The world axes of a WCS, such as "WCS: pos.eq.ra (deg), pos.eq.dec (deg)".
+
+    Read through the shared astropy WCS interface, so it also describes a gwcs WCS. An object
+    without that interface is described by its class.
+    """
+    name = type(wcs).__name__
+    types = getattr(wcs, "world_axis_physical_types", None)
+    units = getattr(wcs, "world_axis_units", None)
+    if types is None or units is None:
+        return name
+    axes = [
+        (kind or f"world axis {i}") + (f" ({unit})" if unit else "")
+        for i, (kind, unit) in enumerate(zip(types, units))
+    ]
+    return f"{name}: {', '.join(axes)}"
+
+
+class AstropyNDDataInspector(PositronInspector[Any]):
+    """
+    An astropy NDData of any class, such as CCDData.
+
+    It is an array with a unit, an uncertainty, a mask, a WCS, and metadata. NDData objects are mutable, so the Variables pane summarizes them again after every execution.
+    That reads no values.
+    """
+
+    UNIT = "Unit"
+    UNCERTAINTY = "Uncertainty"
+    MASK = "Mask"
+    WCS = "WCS"
+    META = "Meta"
+    DATA = "Data"
+
+    def get_display_name(self, key: Any) -> str:
+        uncertainty = self.value.uncertainty
+        if key == self.UNCERTAINTY and uncertainty is not None:
+            return f"{self.UNCERTAINTY} ({type(uncertainty).__name__})"
+        return str(key)
+
+    def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
+        nddata = self.value
+        text = f"[{_shape_text(nddata.data.shape, None)}] {_library_name(nddata)}"
+        unit = _unit_text(nddata.unit)
+        if unit is not None:
+            text += f" {unit}"
+        return _maybe_truncate_string(text, level=level)[0], True
+
+    def get_display_type(self) -> str:
+        data = self.value.data
+        shape = "x".join(str(size) for size in data.shape) if data.shape else "scalar"
+        return f"{type(self.value).__name__} [{shape}] {data.dtype}"
+
+    def get_kind(self) -> str:
+        return "table"
+
+    def has_viewer(self) -> bool:
+        return _has_array_viewer(self.value)
+
+    def get_length(self) -> int:
+        # The Variables pane treats the length as the child count, and adds a "more values"
+        # row when it is larger than the number of children it receives.
+        return len(self.get_children())
+
+    def get_size(self) -> int:
+        data = self.value.data
+        if _is_dask_array(data):
+            return _dask_nbytes(data) or 0
+        return int(getattr(data, "nbytes", 0))
+
+    def has_children(self) -> bool:
+        return True
+
+    def get_children(self) -> list[str]:
+        nddata = self.value
+        children = []
+        if _unit_text(nddata.unit) is not None:
+            children.append(self.UNIT)
+        if nddata.uncertainty is not None:
+            children.append(self.UNCERTAINTY)
+        if nddata.mask is not None:
+            children.append(self.MASK)
+        if nddata.wcs is not None:
+            children.append(self.WCS)
+        if nddata.meta:
+            children.append(self.META)
+        children.append(self.DATA)
+        return children
+
+    def has_child(self, key: Any) -> bool:
+        return key in self.get_children()
+
+    def get_child(self, key: Any) -> Any:
+        nddata = self.value
+        if key not in self.get_children():
+            raise KeyError(key)
+        if key == self.UNIT:
+            return MetadataRow(_unit_text(nddata.unit) or "")
+        if key == self.UNCERTAINTY:
+            # The values of the uncertainty, or its class for one without values
+            array = nddata.uncertainty.array
+            return MetadataRow(type(nddata.uncertainty).__name__) if array is None else array
+        if key == self.MASK:
+            return nddata.mask
+        if key == self.WCS:
+            return MetadataRow(_wcs_text(nddata.wcs))
+        if key == self.META:
+            return nddata.meta
+        return nddata.data
+
+    def to_plaintext(self) -> str:
+        return repr(self.value)
+
+
+def _fits_header_int(header: Any, keyword: str, default: int = 0) -> int:
+    """An integer keyword of a FITS header, or default when it is missing or malformed."""
+    value = header.get(keyword, default)
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+
+def _fits_image_shape(header: Any) -> tuple[int, ...]:
+    """
+    The shape of the data of a FITS image HDU, read from its header, in numpy order.
+
+    FITS numbers the axes from the fastest varying, so NAXIS1 is the last dim of the array.
+    """
+    naxis = _fits_header_int(header, "NAXIS")
+    return tuple(_fits_header_int(header, f"NAXIS{n}") for n in range(naxis, 0, -1))
+
+
+def _fits_image_dims(header: Any) -> list[str] | None:
+    """The dims of a FITS image named by its CTYPEn keywords, or None when not every dim is."""
+    naxis = _fits_header_int(header, "NAXIS")
+    return _valid_dims([header.get(f"CTYPE{n}") for n in range(naxis, 0, -1)], naxis)
+
+
+def _fits_data_nbytes(header: Any) -> int:
+    """The bytes of the data of a FITS HDU, read from its header, as the FITS standard defines."""
+    naxis = _fits_header_int(header, "NAXIS")
+    if naxis == 0:
+        return 0
+    elements = math.prod(_fits_header_int(header, f"NAXIS{n}") for n in range(1, naxis + 1))
+    bitpix = abs(_fits_header_int(header, "BITPIX", 8))
+    gcount = _fits_header_int(header, "GCOUNT", 1)
+    pcount = _fits_header_int(header, "PCOUNT", 0)
+    return bitpix // 8 * gcount * (pcount + elements)
+
+
+def _fits_data_readable(hdu: Any) -> bool:
+    """
+    Whether reading the data of a FITS HDU would succeed.
+
+    Data that was not read before its file was closed can no longer be read.
+    """
+    if getattr(hdu, "_data_loaded", True):
+        return True
+    return not getattr(getattr(hdu, "_file", None), "closed", False)
+
+
+class FitsHDUInspector(PositronInspector[Any]):
+    """
+    A FITS HDU of any kind, such as an ImageHDU or a BinTableHDU.
+
+    Every row reads the header only. The data is read when its row is expanded or viewed.
+    HDUs are mutable and cannot be copied, so the Variables pane summarizes them again after every
+    execution.
+    """
+
+    HEADER = "Header"
+    DATA = "Data"
+
+    def _has_data(self) -> bool:
+        return _fits_header_int(self.value.header, "NAXIS") > 0
+
+    def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
+        hdu = self.value
+        header = hdu.header
+        if not self._has_data():
+            shape = "no data"
+        elif _is_fits_image_hdu(hdu):
+            shape = _shape_text(_fits_image_shape(header), _fits_image_dims(header))
+        elif "TFIELDS" in header:
+            rows = _fits_header_int(header, "NAXIS2")
+            shape = (
+                f"{_count(rows, 'row')} x {_count(_fits_header_int(header, 'TFIELDS'), 'column')}"
+            )
+        else:
+            return _library_name(hdu), True
+        text = f"[{shape}] {_library_name(hdu)}"
+        return _maybe_truncate_string(text, level=level)[0], True
+
+    def get_display_type(self) -> str:
+        hdu = self.value
+        name = type(hdu).__name__
+        if not (_is_fits_image_hdu(hdu) and self._has_data()):
+            return name
+        header = hdu.header
+        shape = "x".join(str(size) for size in _fits_image_shape(header))
+        # Scaled data (BSCALE or BZERO) is read as another dtype than BITPIX gives.
+        scaled = header.get("BSCALE", 1) != 1 or header.get("BZERO", 0) != 0
+        dtype = _FITS_BITPIX_DTYPES.get(_fits_header_int(header, "BITPIX"))
+        return f"{name} [{shape}]" if scaled or dtype is None else f"{name} [{shape}] {dtype}"
+
+    def get_kind(self) -> str:
+        return "table"
+
+    def has_viewer(self) -> bool:
+        return _has_array_viewer(self.value)
+
+    def get_length(self) -> int:
+        # The Variables pane treats the length as the child count, and adds a "more values"
+        # row when it is larger than the number of children it receives.
+        return len(self.get_children())
+
+    def get_size(self) -> int:
+        return _fits_data_nbytes(self.value.header)
+
+    def has_children(self) -> bool:
+        return True
+
+    def get_children(self) -> list[str]:
+        if self._has_data() and _fits_data_readable(self.value):
+            return [self.HEADER, self.DATA]
+        return [self.HEADER]
+
+    def has_child(self, key: Any) -> bool:
+        return key in self.get_children()
+
+    def get_child(self, key: Any) -> Any:
+        if key == self.HEADER:
+            return self.value.header
+        if key == self.DATA and key in self.get_children():
+            return self.value.data
+        raise KeyError(key)
+
+    def to_plaintext(self) -> str:
+        return repr(self.value)
+
+
+class FitsHDUListInspector(PositronInspector[Any]):
+    """
+    The HDUs of a FITS file, as astropy.io.fits.open returns them.
+
+    Listing the HDUs reads every header, but no data. HDULists are mutable and cannot be copied,
+    so the Variables pane summarizes them again after every execution.
+    """
+
+    CLASS_QNAME = _FITS_HDULIST_QNAMES
+
+    def get_display_name(self, key: Any) -> str:
+        # HDUs are keyed by index, since extension names can be missing or repeat.
+        if type(key) is int and 0 <= key < len(self.value):
+            name = self.value[key].name
+            return f"{key}: {name}" if name else str(key)
+        return str(key)
+
+    def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
+        text = f"[{_count(len(self.value), 'HDU')}] {_library_name(self.value)}"
+        return _maybe_truncate_string(text, level=level)[0], True
+
+    def get_display_type(self) -> str:
+        return f"{type(self.value).__name__} [{_count(len(self.value), 'HDU')}]"
+
+    def get_kind(self) -> str:
+        return "table"
+
+    def get_length(self) -> int:
+        return len(self.value)
+
+    def get_size(self) -> int:
+        return sum(_fits_data_nbytes(hdu.header) for hdu in self.value)
+
+    def has_children(self) -> bool:
+        return self.get_length() > 0
+
+    def get_children(self) -> list[int]:
+        return list(range(len(self.value)))
+
+    def has_child(self, key: Any) -> bool:
+        return type(key) is int and 0 <= key < len(self.value)
+
+    def get_child(self, key: Any) -> Any:
+        if not self.has_child(key):
+            raise KeyError(key)
+        return self.value[key]
+
+    def to_plaintext(self) -> str:
+        return repr(self.value)
+
+
+class FitsRecordsInspector(NumpyNdarrayInspector):
+    """The rows of a FITS table HDU, a numpy record array, shown as one row without children."""
+
+    CLASS_QNAME = "astropy.io.fits.fitsrec.FITS_rec"
+
+    def get_display_type(self) -> str:
+        names = ", ".join(self.value.dtype.names or ())
+        return f"{type(self.value).__name__} [{_count(len(self.value), 'row')}] ({names})"
+
+    def get_kind(self) -> str:
+        return "other"
+
+    def get_length(self) -> int:
+        return 0
+
+    def has_children(self) -> bool:
+        return False
+
+    def get_children(self) -> list[Any]:
+        return []
+
+
+def _fits_card_text(card: Any) -> str:
+    """The value of a FITS header card and its comment, such as "-32 / array data type"."""
+    if card.keyword in ("COMMENT", "HISTORY", ""):
+        # Commentary cards have text only.
+        return str(card.value)
+    value = card.value
+    text = repr(value) if isinstance(value, str) else str(value)
+    return f"{text} / {card.comment}" if card.comment else text
+
+
+class FitsHeaderInspector(PositronInspector[Any]):
+    """
+    A FITS header.
+
+    Its cards are keyed by index, since keywords such as COMMENT and HISTORY repeat.
+    """
+
+    CLASS_QNAME = _FITS_HEADER_QNAMES
+
+    def get_display_name(self, key: Any) -> str:
+        if self.has_child(key):
+            return self.value.cards[key].keyword or f"card {key}"
+        return str(key)
+
+    def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
+        keywords = list(self.value.keys())
+        if not keywords:
+            return _NONE_TEXT, False
+        return _format_name_list(keywords, level=level)
+
+    def get_display_type(self) -> str:
+        return f"{type(self.value).__name__} [{_count(len(self.value), 'card')}]"
+
+    def get_kind(self) -> str:
+        return "map"
+
+    def get_length(self) -> int:
+        return len(self.value)
+
+    def has_children(self) -> bool:
+        return self.get_length() > 0
+
+    def get_children(self) -> list[int]:
+        return list(range(len(self.value)))
+
+    def has_child(self, key: Any) -> bool:
+        return type(key) is int and 0 <= key < len(self.value)
+
+    def get_child(self, key: Any) -> Any:
+        if not self.has_child(key):
+            raise KeyError(key)
+        return MetadataRow(_fits_card_text(self.value.cards[key]))
+
+    def to_plaintext(self) -> str:
+        return self.value.tostring(sep="\n")
+
+
 INSPECTOR_CLASSES: dict[str, type[PositronInspector]] = {
     # xarray inspectors and their child rows
     **dict.fromkeys(XarrayDatasetInspector.CLASS_QNAME, XarrayDatasetInspector),
@@ -2872,9 +3322,12 @@ INSPECTOR_CLASSES: dict[str, type[PositronInspector]] = {
     **dict.fromkeys(ZarrGroupInspector.CLASS_QNAME, ZarrGroupInspector),
     **dict.fromkeys(H5pyDatasetInspector.CLASS_QNAME, H5pyDatasetInspector),
     **dict.fromkeys(H5pyGroupInspector.CLASS_QNAME, H5pyGroupInspector),
-    # HyperSpy metadata trees. Signals have many classes, so get_inspector matches them by base
-    # class instead.
+    # HyperSpy metadata trees and FITS files. HyperSpy signals and astropy quantities, NDData, and
+    # HDUs have many classes, so get_inspector matches them by base class instead.
     **dict.fromkeys(HyperspyTreeInspector.CLASS_QNAME, HyperspyTreeInspector),
+    **dict.fromkeys(FitsHDUListInspector.CLASS_QNAME, FitsHDUListInspector),
+    **dict.fromkeys(FitsHeaderInspector.CLASS_QNAME, FitsHeaderInspector),
+    FitsRecordsInspector.CLASS_QNAME: FitsRecordsInspector,
     get_qualname(MetadataRow): MetadataRowInspector,
     get_qualname(ArrayGroup): ArrayGroupInspector,
     # Geopandas inspectors (before pandas to take precedence)
@@ -2936,9 +3389,8 @@ def get_inspector(value: T) -> PositronInspector[T]:
     if inspector_cls is MapInspector and not isinstance(value, Mapping):
         inspector_cls = None
 
-    if inspector_cls is None and _is_hyperspy_signal(value):
-        # HyperSpy and its extensions define many signal classes, all subclasses of BaseSignal
-        inspector_cls = HyperspySignalInspector
+    if inspector_cls is None:
+        inspector_cls = _base_class_inspector(value)
 
     if inspector_cls is None:
         # Otherwise, look for an inspector by kind
@@ -2950,6 +3402,24 @@ def get_inspector(value: T) -> PositronInspector[T]:
         inspector_cls = PositronInspector
 
     return inspector_cls(value)
+
+
+def _base_class_inspector(value: Any) -> type[PositronInspector] | None:
+    """
+    The inspector of a library class that has many subclasses, matched by its base class.
+
+    For example, HyperSpy and its extensions define many signal classes, all subclasses of
+    BaseSignal. Each check is skipped when its library has not been imported.
+    """
+    if _is_hyperspy_signal(value):
+        return HyperspySignalInspector
+    if _is_quantity(value):
+        return AstropyQuantityInspector
+    if _is_nddata(value):
+        return AstropyNDDataInspector
+    if _is_fits_hdu(value):
+        return FitsHDUInspector
+    return None
 
 
 def _get_kind(value: Any) -> str:

@@ -1100,3 +1100,68 @@ def test_array_view_hyperspy_non_uniform_axis(dxf: DataExplorerFixture):
     spectrum = hs.signals.Signal1D(np.arange(3.0), axes=[energy])
     dxf.register_table("sp", spectrum)
     assert _row_labels(dxf, "sp", 3) == ["1.0", "2.0", "4.0"]
+
+
+#
+# astropy
+#
+
+
+def test_array_view_quantity(dxf: DataExplorerFixture):
+    u = pytest.importorskip("astropy.units")
+    q = np.arange(6.0).reshape(2, 3) * u.km
+    dxf.register_table("q", q)
+    assert _column_values(dxf, "q", 1, 2) == ["1.00", "4.00"]
+
+
+def test_array_view_nddata_mask(dxf: DataExplorerFixture):
+    nddata_mod = pytest.importorskip("astropy.nddata")
+    ccd = nddata_mod.CCDData(
+        np.arange(6.0).reshape(3, 2), unit="adu", mask=np.array([[False, True]] * 3)
+    )
+    assert get_inspector(ccd).has_viewer()
+    dxf.register_table("ccd", ccd)
+    assert _column_values(dxf, "ccd", 0, 3) == ["0.00", "2.00", "4.00"]
+    # The masked column shows as missing.
+    assert _column_values(dxf, "ccd", 1, 3) == [_VALUE_NA] * 3
+
+
+def test_array_view_fits_image(dxf: DataExplorerFixture, tmp_path):
+    fits = pytest.importorskip("astropy.io.fits")
+    header = fits.Header()
+    header["CTYPE1"] = "RA---TAN"
+    header["CTYPE2"] = "DEC--TAN"
+    hdus = fits.HDUList(
+        [
+            fits.PrimaryHDU(np.arange(6.0).reshape(2, 3)),
+            fits.ImageHDU(np.arange(12.0).reshape(3, 4), header=header, name="SCI"),
+        ]
+    )
+    hdus.writeto(tmp_path / "image.fits")
+    with fits.open(tmp_path / "image.fits") as hdul:
+        dxf.register_table("sci", hdul["SCI"])
+        state = dxf.get_state("sci")
+        assert (state["row_axis_name"], state["column_axis_name"]) == ("DEC--TAN", "RA---TAN")
+        assert _column_values(dxf, "sci", 1, 3) == ["1.00", "5.00", "9.00"]
+        # Without CTYPEn keywords, the image opens like a numpy array.
+        dxf.register_table("primary", hdul[0])
+        assert dxf.get_state("primary").get("row_axis_name") is None
+        assert _column_values(dxf, "primary", 2, 2) == ["2.00", "5.00"]
+
+
+def test_array_view_astropy_unavailable_messages():
+    nddata_mod = pytest.importorskip("astropy.nddata")
+    fits = pytest.importorskip("astropy.io.fits")
+    cube = np.zeros((2, 3, 4))
+    assert _array_view_unavailable_message(nddata_mod.NDData(cube), "nd") == (
+        "nd has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. nd.data[0]"
+    )
+    assert _array_view_unavailable_message(nddata_mod.CCDData(cube, unit="adu"), "c") == (
+        "c has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. c[0]"
+    )
+    assert _array_view_unavailable_message(fits.ImageHDU(cube), "hdu") == (
+        "hdu has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. hdu.data[0]"
+    )
