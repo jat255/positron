@@ -2220,19 +2220,33 @@ def _count(n: int, noun: str) -> str:
     return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
 
 
-def _zarr_dims(array: Any) -> Sequence[Any] | None:
+def _zarr_dims(array: Any) -> list[str] | None:
     """The dim names of a zarr array, or None when the store does not name every dim."""
     # zarr format 3 names dims in the array metadata. xarray names them in an attribute when it
     # writes zarr format 2.
     names = getattr(getattr(array, "metadata", None), "dimension_names", None)
     if names is None:
         names = array.attrs.get("_ARRAY_DIMENSIONS")
-    if names is None or any(name is None for name in names):
+    return _valid_dims(names, array.ndim)
+
+
+def _valid_dims(names: Any, ndim: int) -> list[str] | None:
+    """
+    Check dim names read from metadata, which any writer can set, such as a zarr attribute.
+
+    Returns the names as a list when there is one distinct, non-empty string per dim of an array
+    with ndim dims, else None.
+    """
+    if not isinstance(names, (list, tuple)) or len(names) != ndim:
         return None
-    return names
+    if not all(isinstance(name, str) and name for name in names):
+        return None
+    if len(set(names)) != len(names):
+        return None
+    return list(names)
 
 
-def _h5py_dims(dataset: Any) -> Sequence[Any] | None:
+def _h5py_dims(dataset: Any) -> list[str] | None:
     """The dim names of an h5py dataset, or None when the file does not name every dim."""
     # An anonymous dataset, not linked into the file, has no name.
     if dataset.name and dataset.ndim == 1 and sys.modules["h5py"].h5ds.is_scale(dataset.id):
@@ -2243,10 +2257,8 @@ def _h5py_dims(dataset: Any) -> Sequence[Any] | None:
         # A dim is named by its label, or else by its dimension scale, as in netCDF4 files.
         scales = dim.values()
         name = dim.label or (scales[0].name.rsplit("/", 1)[-1] if scales else None)
-        if not name:
-            return None
         names.append(name)
-    return names
+    return _valid_dims(names, dataset.ndim)
 
 
 def _is_stored_array(value: Any) -> bool:
@@ -2258,7 +2270,7 @@ def _is_stored_array(value: Any) -> bool:
     return qualname in _H5PY_DATASET_QNAMES and bool(value)
 
 
-def _stored_array_dims(value: Any) -> Sequence[Any] | None:
+def _stored_array_dims(value: Any) -> list[str] | None:
     """The dim names of a zarr array or an h5py dataset, or None when not every dim is named."""
     if get_qualname(type(value)) in _ZARR_ARRAY_QNAMES:
         return _zarr_dims(value)
@@ -2288,7 +2300,7 @@ class _StoredArrayInspector(PositronInspector[Any], ABC):
         return True
 
     @abstractmethod
-    def _dims(self) -> Sequence[Any] | None:
+    def _dims(self) -> list[str] | None:
         """The dim names, or None when the store does not name every dim."""
 
     @abstractmethod
@@ -2432,7 +2444,7 @@ class ZarrArrayInspector(_StoredArrayInspector):
     LIBRARY = "zarr"
     STORE = "Store"
 
-    def _dims(self) -> Sequence[Any] | None:
+    def _dims(self) -> list[str] | None:
         return _zarr_dims(self.value)
 
     def _metadata(self) -> dict[str, str]:
@@ -2484,7 +2496,7 @@ class H5pyDatasetInspector(_StoredArrayInspector):
         # A dataset of a closed file is falsy, and reading its metadata raises.
         return bool(self.value)
 
-    def _dims(self) -> Sequence[Any] | None:
+    def _dims(self) -> list[str] | None:
         return _h5py_dims(self.value)
 
     def _metadata(self) -> dict[str, str]:

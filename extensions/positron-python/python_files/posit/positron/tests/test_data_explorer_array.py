@@ -1011,3 +1011,12 @@ def test_stored_array_viewer_respects_size_limit(tmp_path):
             "cube has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
             "Select a slice first, e.g. cube[0]"
         )
+
+
+@pytest.mark.parametrize("names", [[], ["lat"], ["lat", "lat"]])
+def test_array_view_zarr_malformed_dim_names(dxf: DataExplorerFixture, tmp_path, names):
+    # Malformed dim names open the array like a numpy array.
+    array = _zarr_array(tmp_path, np.arange(6.0).reshape(3, 2), names)
+    dxf.register_table("z", array)
+    assert dxf.get_state("z").get("row_axis_name") is None
+    assert _column_values(dxf, "z", 1, 3) == ["1.00", "3.00", "5.00"]

@@ -305,3 +305,14 @@ def test_group_is_listed_once_per_summary(kind, zarr_group, h5_file, mocker):
 def test_h5py_missing_member(h5_file):
     with pytest.raises(KeyError):
         get_inspector(h5_file).get_child("missing")
+
+
+@pytest.mark.parametrize(
+    "names",
+    [[], ["lat"], ["lat", "lat"], ["lat", ""], ["lat", 1], "latlon", None],
+)
+def test_zarr_array_ignores_malformed_dim_names(zarr_group, names):
+    # Any writer can set _ARRAY_DIMENSIONS, so names that do not name every dim once are ignored.
+    array = _create_array(zarr_group, "odd", shape=(3, 2), dtype="f4")
+    array.attrs["_ARRAY_DIMENSIONS"] = names
+    assert get_inspector(array).get_display_value()[0] == "[3 x 2] zarr.Array"

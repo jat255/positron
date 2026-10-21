@@ -3266,9 +3266,9 @@ class _ArrayTable:
         import numpy as np
 
         stored_dims = _stored_array_dims(value)
-        if stored_dims is None or len(set(stored_dims)) != len(stored_dims):
+        if stored_dims is None:
             return None
-        dims = tuple(str(dim) for dim in stored_dims)
+        dims = tuple(stored_dims)
         name = _stored_array_name(value)
         values = np.asarray(value[...])
         if values.ndim == 1:
