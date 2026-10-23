@@ -26,6 +26,8 @@ from .utils import (
     CapturedError,
     assert_register_table_called,
     capture_errors,
+    make_dataset,
+    make_lazy_dataset,
     patch_positron_execute_request,
 )
 
@@ -146,6 +148,132 @@ def test_view_expression_error(
     shell.run_cell('%view "undefined_var + 1"')
     mock_dataexplorer_service.register_table.assert_not_called()
     assert "Failed to evaluate expression" in capsys.readouterr().err
+
+
+def test_view_xarray_dataset_explains(shell: PositronShell, capsys) -> None:
+    shell.user_ns["ds"] = make_dataset()
+    shell.run_cell("%view ds")
+    assert capsys.readouterr().err == (
+        "UsageError: ds is an xarray Dataset; view one of its variables, e.g. %view ds['sst']\n"
+    )
+
+
+def test_view_3d_array_explains(shell: PositronShell, capsys) -> None:
+    shell.user_ns["ds"] = make_dataset()
+    shell.run_cell('%view "ds.sst"')
+    assert capsys.readouterr().err == (
+        "UsageError: ds.sst has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. ds.sst.isel(time=0)\n"
+    )
+
+    shell.user_ns["lazy"] = make_lazy_dataset()["sst"].data
+    shell.run_cell("%view lazy")
+    assert capsys.readouterr().err == (
+        "UsageError: lazy has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. lazy[0]\n"
+    )
+
+
+def test_view_expression_explains_with_parentheses(shell: PositronShell, capsys) -> None:
+    ds = make_dataset()
+    shell.user_ns["left"] = ds["sst"]
+    shell.user_ns["right"] = ds["sst"]
+    shell.run_cell('%view "left + right"')
+    assert capsys.readouterr().err == (
+        "UsageError: left + right has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. (left + right).isel(time=0)\n"
+    )
+
+
+def test_view_dataset_expression_suggests_a_valid_command(shell: PositronShell, capsys) -> None:
+    np = pytest.importorskip("numpy")
+    xr = pytest.importorskip("xarray")
+    ds = xr.Dataset({"my var": (("a", "b"), np.zeros((2, 2)))})
+    shell.user_ns["left"] = ds
+    shell.user_ns["right"] = ds
+    shell.run_cell('%view "left + right"')
+    err = capsys.readouterr().err
+    command = "%view \"(left + right)['my var']\""
+    assert err == (
+        f"UsageError: left + right is an xarray Dataset; view one of its variables, e.g. {command}\n"
+    )
+    # The suggested command opens the variable
+    shell.run_cell(command)
+    assert capsys.readouterr().err == ""
+
+
+def test_view_expression_with_comment_suggests_runnable_code(shell: PositronShell, capsys) -> None:
+    np = pytest.importorskip("numpy")
+    xr = pytest.importorskip("xarray")
+    shell.user_ns["arr"] = xr.DataArray(np.zeros((2, 2, 2)), dims=("time", "y", "x"))
+    shell.run_cell('%view "arr # note"')
+    assert capsys.readouterr().err == (
+        "UsageError: arr # note has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+        "Select a slice first, e.g. arr.isel(time=0)\n"
+    )
+    shell.run_cell("%view arr.isel(time=0)")
+    assert capsys.readouterr().err == ""
+
+    shell.user_ns["ds"] = xr.Dataset({"v": (("a", "b"), np.zeros((2, 2)))})
+    shell.run_cell('%view "ds # note"')
+    command = "%view ds['v']"
+    assert capsys.readouterr().err == (
+        f"UsageError: ds # note is an xarray Dataset; view one of its variables, e.g. {command}\n"
+    )
+    # The suggested command opens the variable, not the Dataset
+    shell.run_cell(command)
+    assert capsys.readouterr().err == ""
+
+
+def test_view_dataset_without_a_valid_command_lists_variables(shell: PositronShell, capsys) -> None:
+    np = pytest.importorskip("numpy")
+    xr = pytest.importorskip("xarray")
+    shell.user_ns["x"] = "other"
+    for name in ("a' \"b", "{x}"):
+        shell.user_ns["ds"] = xr.Dataset({name: (("a", "b"), np.zeros((2, 2)))})
+        shell.run_cell("%view ds")
+        assert capsys.readouterr().err == (
+            f"UsageError: ds is an xarray Dataset; view one of its data variables: {name}\n"
+        )
+
+
+def test_view_dataset_suggested_commands_run(shell: PositronShell, capsys) -> None:
+    np = pytest.importorskip("numpy")
+    xr = pytest.importorskip("xarray")
+    for name, command in (
+        ("a#b", "%view ds['a#b']"),
+        ("$HOME", "%view ds['$HOME']"),
+        ("my var", "%view \"ds['my var']\""),
+        ("isel", "%view ds['isel']"),
+    ):
+        shell.user_ns["ds"] = xr.Dataset({name: (("a", "b"), np.zeros((2, 2)))})
+        shell.run_cell("%view ds")
+        assert capsys.readouterr().err.endswith(f"e.g. {command}\n")
+        shell.run_cell(command)
+        assert capsys.readouterr().err == ""
+
+
+def test_view_array_over_size_limit_explains(shell: PositronShell, capsys) -> None:
+    dask_array = pytest.importorskip("dask.array")
+    shell.user_ns["big"] = dask_array.zeros((6000, 6000))  # never computed
+    shell.run_cell("%view big")
+    assert capsys.readouterr().err == (
+        "UsageError: big is 274.7 MiB (not in memory), over the 100.0 MiB limit for the "
+        "Data Explorer. Select a smaller slice or call .compute() first.\n"
+    )
+
+
+def test_view_lazy_object_array_explains(shell: PositronShell, capsys) -> None:
+    np = pytest.importorskip("numpy")
+    from .utils import make_compute_bomb
+
+    # The bomb makes any computation fail the test.
+    shell.user_ns["lazy"] = make_compute_bomb(np.array(["x" * 1000] * 4, dtype=object), chunks=2)
+    shell.run_cell("%view lazy")
+    assert capsys.readouterr().err == (
+        "UsageError: lazy has object dtype and is not in memory, so the memory it needs is not "
+        "known until it is loaded. Call .compute() first.\n"
+    )
 
 
 def assert_register_connection_called(mock_connections_service: Mock, obj: Any) -> None:

@@ -730,8 +730,26 @@ class _BaseArrayInspector(_BaseCollectionInspector[Array], ABC):
         return True
 
 
+def _has_array_viewer(value: Any) -> bool:
+    # Imported here since data_explorer imports this module
+    from .data_explorer import _is_viewable_array
+
+    return _is_viewable_array(value)
+
+
 class NumpyNdarrayInspector(_BaseArrayInspector["np.ndarray"]):
     CLASS_QNAME = "numpy.ndarray"
+
+    def get_kind(self) -> str:
+        # Arrays that open in the Data Explorer are tables, and the frontend labels the viewer of a
+        # "table" as "View Data Table". Others, such as structured arrays, stay collections so
+        # that %view opens them in the Object Explorer.
+        if self.value.ndim in (1, 2) and self.has_viewer():
+            return "table"
+        return super().get_kind()
+
+    def has_viewer(self) -> bool:
+        return _has_array_viewer(self.value)
 
     def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
         if level >= len(MAX_ITEMS_BY_LEVEL):
@@ -2023,6 +2041,9 @@ class _XarrayArrayInspector(PositronInspector[XarrayArray], ABC):
     def get_kind(self) -> str:
         return "table"
 
+    def has_viewer(self) -> bool:
+        return _has_array_viewer(self.value)
+
     def get_length(self) -> int:
         # The Variables pane treats the length as the child count, and adds a "more values"
         # row when it is larger than the number of children it receives.
@@ -2132,6 +2153,9 @@ class DaskArrayInspector(PositronInspector["DaskArray"]):
 
     def get_kind(self) -> str:
         return "table"
+
+    def has_viewer(self) -> bool:
+        return _has_array_viewer(self.value)
 
     def get_length(self) -> int:
         # The Variables pane treats the length as the child count, and adds a "more values"

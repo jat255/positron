@@ -7,9 +7,12 @@
 # pyright: reportOptionalMemberAccess=false
 from __future__ import annotations
 
+import ast
+import keyword
 import logging
 import math
 import operator
+import sys
 from datetime import datetime
 from decimal import Decimal
 from types import MappingProxyType
@@ -17,7 +20,9 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Iterable,
     Tuple,
+    cast,
 )
 
 import comm
@@ -106,11 +111,20 @@ from .data_explorer_comm import (
     TableShape,
     TextSearchType,
 )
+from .inspectors import (
+    _dask_nbytes,
+    _dask_variables,
+    _format_name_list,
+    _format_nbytes,
+    _is_dask_array,
+    _is_own_coordinate,
+)
 from .positron_comm import CommMessage, PositronComm
 from .third_party import is_ibis, is_pandas, is_polars
 from .utils import BackgroundJobQueue, guid
 
 if TYPE_CHECKING:
+    import numpy as np
     import pandas as pd
     import polars as pl
 
@@ -242,7 +256,7 @@ class DataExplorerTableView:
             ]
 
     @property
-    def _has_row_labels(self):
+    def _has_row_labels(self) -> bool:
         return False
 
     @classmethod
@@ -797,7 +811,7 @@ class DataExplorerTableView:
 
     def _prof_summary_stats(self, column_index: int, options: FormatOptions) -> ColumnSummaryStats:
         col_schema = self._get_single_column_schema(column_index)
-        col = self._get_column(column_index)
+        col = self._get_summary_values(column_index)
 
         ui_type = col_schema.type_display
         handler = self._SUMMARIZERS.get(ui_type, _summarize_not_implemented)
@@ -810,6 +824,10 @@ class DataExplorerTableView:
 
     def _get_column(self, column_index: int):
         raise NotImplementedError
+
+    def _get_summary_values(self, column_index: int):
+        """Return the column values that the summarizers read."""
+        return self._get_column(column_index)
 
     def _prof_freq_table(
         self,
@@ -1018,6 +1036,42 @@ def _builtin_isnan(value):
 
 def _builtin_isinf(value):
     return math.isinf(value)
+
+
+def _get_value_formatter(
+    options: FormatOptions,
+    math_helper: NumPyMathHelper,
+    is_nat: Callable[[Any], bool],
+    is_na: Callable[[Any], bool],
+) -> Callable[[Any], ColumnValue]:
+    """
+    Return a function that formats one cell value for the frontend.
+
+    Floats use the float formatting options, and missing or non-finite values become the
+    protocol's special value codes. `is_nat` and `is_na` recognize the backend's own
+    not-a-time and missing-value markers.
+    """
+    float_format = _get_float_formatter(options)
+    max_length = options.max_value_length
+
+    def _format_value(x):
+        if math_helper.is_float_scalar(x):
+            if math_helper.isnan(x):
+                return _VALUE_NAN
+            elif math_helper.isinf(x):
+                return _VALUE_INF if x > 0 else _VALUE_NEGINF
+            else:
+                return float_format(x)
+        elif x is None:
+            return _VALUE_NONE
+        elif is_nat(x):
+            return _VALUE_NAT
+        elif is_na(x):
+            return _VALUE_NA
+        else:
+            return _safe_stringify(x, max_length)
+
+    return _format_value
 
 
 def _get_float_formatter(options: FormatOptions) -> Callable:
@@ -1653,26 +1707,12 @@ class PandasView(DataExplorerTableView):
     def _format_values(self, values, options: FormatOptions) -> list[ColumnValue]:
         import pandas as pd
 
-        float_format = _get_float_formatter(options)
-        max_length = options.max_value_length
-
-        def _format_value(x):
-            if self.math_helper.is_float_scalar(x):
-                if self.math_helper.isnan(x):
-                    return _VALUE_NAN
-                elif self.math_helper.isinf(x):
-                    return _VALUE_INF if x > 0 else _VALUE_NEGINF
-                else:
-                    return float_format(x)
-            elif x is None:
-                return _VALUE_NONE
-            elif x is pd.NaT:
-                return _VALUE_NAT
-            elif x is pd.NA:
-                return _VALUE_NA
-            else:
-                return _safe_stringify(x, max_length)
-
+        _format_value = _get_value_formatter(
+            options,
+            self.math_helper,
+            is_nat=lambda x: x is pd.NaT,
+            is_na=lambda x: x is pd.NA,
+        )
         return [_format_value(x) for x in values]
 
     def _export_tabular(self, row_selector, column_selector, fmt: ExportFormat):
@@ -2897,6 +2937,709 @@ class IbisView(PandasView):
     )
 
 
+# ----------------------------------------------------------------------
+# Array Data Explorer RPC implementations for 1-D and 2-D numpy, xarray, and dask arrays
+
+# Opening an array view loads its values into memory. That computes a dask-backed array and reads
+# a lazily indexed one (for example a variable opened from a file without chunks). Larger arrays
+# that are not already in memory have no Data Explorer view.
+ARRAY_VIEW_MAX_LAZY_BYTES = 100 * 1024 * 1024
+
+
+def _is_array(value: Any) -> bool:
+    """Whether value is a numpy array, xarray DataArray or Variable, or dask array."""
+    np_module = sys.modules.get("numpy")
+    xr_module = sys.modules.get("xarray")
+    return (
+        (np_module is not None and isinstance(value, np_module.ndarray))
+        or (xr_module is not None and isinstance(value, (xr_module.DataArray, xr_module.Variable)))
+        or _is_dask_array(value)
+    )
+
+
+def _array_lazy_nbytes(value: Any) -> int | None:
+    """
+    The bytes that opening an array view would load into memory, read from metadata only.
+
+    Returns 0 for an array that is already in memory, and None when the size of a dim is not
+    known until the array is computed.
+    """
+    np_module = sys.modules.get("numpy")
+    if np_module is not None and isinstance(value, np_module.ndarray):
+        return 0
+    dask_sizes = [_dask_nbytes(array) for _, array in _dask_variables(value)]
+    if dask_sizes:
+        if None in dask_sizes:
+            return None
+        return sum(cast("list[int]", dask_sizes))
+    # A DataArray or Variable that is not dask-backed. xarray has no public check for whether its
+    # data is loaded, so read Variable._in_memory, and treat the data as lazy if it is missing.
+    if getattr(getattr(value, "variable", value), "_in_memory", False):
+        return 0
+    return int(value.nbytes)
+
+
+def _is_lazy_object_array(value: Any, nbytes: int | None) -> bool:
+    """
+    Whether value is an object-dtype array that is not in memory, given its lazy nbytes.
+
+    The itemsize of an object dtype counts only pointers, so nbytes cannot bound the memory that
+    loading the objects (for example long strings) needs.
+    """
+    return value.dtype.kind == "O" and nbytes != 0
+
+
+def _is_viewable_array(value: Any) -> bool:
+    """Whether value is a 1-D or 2-D numpy array, xarray DataArray or Variable, or dask array."""
+    if not _is_array(value) or value.ndim not in (1, 2):
+        return False
+    if value.dtype.names is not None:
+        # Structured dtypes have no single column type
+        return False
+    nbytes = _array_lazy_nbytes(value)
+    if nbytes is None or _is_lazy_object_array(value, nbytes):
+        return False
+    return nbytes <= ARRAY_VIEW_MAX_LAZY_BYTES
+
+
+def _array_view_unavailable_message(value: Any, expr: str) -> str | None:
+    """
+    Explain why the Data Explorer cannot show value, which expr evaluates to.
+
+    Returns None when value is not an array or Dataset, or when the Data Explorer can show it.
+    The message names expr as typed. Each suggestion is built from the parsed expr, so it is
+    valid code whatever expr's spacing, comments, or operators; when no valid suggestion exists,
+    the message gives plain guidance instead.
+    """
+    node = _parse_expr(expr)
+    xr_module = sys.modules.get("xarray")
+    if xr_module is not None and isinstance(value, xr_module.Dataset):
+        names = list(value.data_vars)
+        if not names:
+            return f"{expr} is an xarray Dataset with no data variables to view"
+        key = _literal_node(names[0])
+        command = None
+        if node is not None and key is not None:
+            command = _view_command(ast.Subscript(value=node, slice=key, ctx=ast.Load()))
+        if command is None:
+            return (
+                f"{expr} is an xarray Dataset; view one of its data variables: "
+                f"{_format_name_list(names)[0]}"
+            )
+        return f"{expr} is an xarray Dataset; view one of its variables, e.g. {command}"
+    if not _is_array(value):
+        return None
+    if value.ndim > 2:
+        example = None if node is None else _slice_example(value, node)
+        suggestion = "." if example is None else f", e.g. {example}"
+        return (
+            f"{expr} has {value.ndim} dimensions; the Data Explorer shows 1-D and 2-D arrays. "
+            f"Select a slice first{suggestion}"
+        )
+    if value.ndim in (1, 2):
+        nbytes = _array_lazy_nbytes(value)
+        if nbytes is None:
+            return (
+                f"{expr} has a shape that is not known until it is computed. Call .compute() first."
+            )
+        if _is_lazy_object_array(value, nbytes):
+            return (
+                f"{expr} has object dtype and is not in memory, so the memory it needs is not "
+                "known until it is loaded. Call .compute() first."
+            )
+        if nbytes > ARRAY_VIEW_MAX_LAZY_BYTES:
+            return (
+                f"{expr} is {_format_nbytes(nbytes)} (not in memory), over the "
+                f"{_format_nbytes(ARRAY_VIEW_MAX_LAZY_BYTES)} limit for the Data Explorer. "
+                "Select a smaller slice or call .compute() first."
+            )
+    return None
+
+
+def _parse_expr(expr: str) -> ast.expr | None:
+    """The parsed expression expr, or None when it is not a single Python expression."""
+    try:
+        return ast.parse(expr.strip(), mode="eval").body
+    except (SyntaxError, ValueError):
+        return None
+
+
+def _literal_node(value: Any) -> ast.expr | None:
+    """A literal expression that evaluates to value, or None when value has no literal form."""
+    try:
+        # A str subclass such as numpy.str_ has a repr that is not a literal
+        text = repr(str(value)) if isinstance(value, str) else repr(value)
+        if not _objects_equal(ast.literal_eval(text), value):
+            return None
+        return ast.parse(text, mode="eval").body
+    except Exception:
+        return None
+
+
+def _slice_example(value: Any, node: ast.expr) -> str | None:
+    """Code that selects the first slice along the first dim of value, which node evaluates to."""
+    xr_module = sys.modules.get("xarray")
+    if xr_module is None or not isinstance(value, (xr_module.DataArray, xr_module.Variable)):
+        return ast.unparse(ast.Subscript(value=node, slice=ast.Constant(0), ctx=ast.Load()))
+    dim = value.dims[0]
+    isel = ast.Attribute(value=node, attr="isel", ctx=ast.Load())
+    if isinstance(dim, str) and dim.isidentifier() and not keyword.iskeyword(dim):
+        call = ast.Call(func=isel, args=[], keywords=[ast.keyword(arg=dim, value=ast.Constant(0))])
+    else:
+        key = _literal_node(dim)
+        if key is None:
+            return None
+        call = ast.Call(
+            func=isel, args=[ast.Dict(keys=[key], values=[ast.Constant(0)])], keywords=[]
+        )
+    return ast.unparse(call)
+
+
+def _view_command(node: ast.expr) -> str | None:
+    """
+    A %view command that opens what node evaluates to, or None when no command can.
+
+    ast.unparse adds the parentheses that operator precedence needs. IPython replaces `{expr}`
+    in a magic's arguments with the value of expr, so code with braces cannot be a %view
+    argument. %view splits its arguments on whitespace and strips one pair of quotes around each.
+    On Windows only double quotes quote an argument, and a double quote inside an argument is
+    removed, so code that has a double quote cannot be a %view argument either. Other code is
+    quoted with double quotes when it has whitespace or starts with a single quote.
+    """
+    code = ast.unparse(node)
+    if any(c in code for c in '"{}'):
+        return None
+    if any(c.isspace() for c in code) or code.startswith("'"):
+        return f'%view "{code}"'
+    return f"%view {code}"
+
+
+class _ArrayTable:
+    """
+    A 1-D or 2-D array in the table shape that DataExplorerTableView reads.
+
+    `values` is always a 2-D numpy array: a 1-D array becomes a single column.
+    """
+
+    def __init__(
+        self,
+        values: np.ndarray,
+        columns: list[str],
+        row_labels: list[str] | None,
+        dims: tuple[str, ...],
+        name: str | None,
+        mask: np.ndarray | None = None,
+        label_units: str | None = None,
+    ):
+        self.values = values
+        # 2-D boolean array, True where a cell is masked (missing), or None
+        self.mask = mask
+        self.shape: tuple[int, int] = (values.shape[0], values.shape[1])
+        self.dtype = values.dtype
+        self.columns = columns
+        self.row_labels = row_labels
+        self.dims = dims
+        self.name = name
+        # The `units` attr of the column dim's coordinate (2-D) or of the array itself (1-D)
+        self.label_units = label_units
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    @classmethod
+    def from_value(cls, value: Any) -> _ArrayTable:
+        if isinstance(value, _ArrayTable):
+            return value
+        if not _is_viewable_array(value):
+            raise TypeError(f"Cannot view value of type {type(value)} as an array table")
+
+        import numpy as np
+
+        mask = None
+        label_units = None
+        xr_module = sys.modules.get("xarray")
+        if xr_module is not None and isinstance(value, xr_module.Variable):
+            # A DataArray without coordinates or a name shows a Variable's dims and attrs. It
+            # wraps the Variable's data without loading it. The base Variable of an
+            # IndexVariable keeps the DataArray from adding a coordinate that repeats its values.
+            value = xr_module.DataArray(value.to_base_variable())
+        if xr_module is not None and isinstance(value, xr_module.DataArray):
+            # .values computes a dask-backed DataArray
+            values = np.asarray(value.values)
+            dims = tuple(str(dim) for dim in value.dims)
+            name = None if value.name is None else str(value.name)
+            row_dim = value.dims[0]
+            if row_dim not in value.coords or (
+                value.ndim == 1 and _is_own_coordinate(value, row_dim)
+            ):
+                # Without a row coordinate, index positions would repeat the grid's row numbers.
+                # A DataArray that is its own dim's coordinate (for example ds.time) would
+                # repeat each row's value. The grid shows its row numbers in both cases.
+                row_labels = None
+            else:
+                row_labels = cls._dim_labels(value, row_dim)
+            if value.ndim == 1:
+                columns = ["0" if name is None else name]
+            else:
+                # Columns need names, so a dim without a coordinate uses index positions.
+                columns = cls._dim_labels(value, value.dims[1])
+            if value.ndim == 1:
+                label_units = cls._units(value)
+            elif value.dims[1] in value.coords:
+                label_units = cls._units(value.coords[value.dims[1]])
+        else:
+            if isinstance(value, np.ma.MaskedArray):
+                # np.asarray would drop the mask
+                mask = np.ma.getmaskarray(value)
+                value = np.ma.getdata(value)
+            # np.asarray computes a dask array
+            values = np.asarray(value)
+            dims = ()
+            name = None
+            row_labels = None
+            columns = ["0"] if values.ndim == 1 else [str(i) for i in range(values.shape[1])]
+
+        if values.ndim == 1:
+            values = values.reshape(-1, 1)
+            if mask is not None:
+                mask = mask.reshape(-1, 1)
+        return cls(values, columns, row_labels, dims, name, mask, label_units)
+
+    def column_label(self, column_index: int) -> str | None:
+        """
+        The column name tooltip, or None for numpy arrays.
+
+        For a 2-D DataArray it names the column dim and coordinate value, for example
+        "lon = 275.125 degrees_east". For a 1-D DataArray it names the array and its dim, for
+        example "sst (time)". The coordinate's (or 1-D array's) `units` attr follows when set.
+
+        Built from the column names, which already hold the formatted coordinate values (index
+        positions for a dim without a coordinate), so it reads no data.
+        """
+        if not self.dims:
+            return None
+        column = self.columns[column_index]
+        if len(self.dims) == 1:
+            label = f"{column} ({self.dims[0]})"
+        else:
+            label = f"{self.dims[1]} = {column}"
+        return label if self.label_units is None else f"{label} {self.label_units}"
+
+    @staticmethod
+    def _units(data_array: Any) -> str | None:
+        units = data_array.attrs.get("units")
+        return None if units is None or str(units) == "" else str(units)
+
+    @staticmethod
+    def _dim_labels(data_array: Any, dim: Any) -> list[str]:
+        # Use the dim's coordinate values when it has one, else index positions
+        if dim in data_array.coords:
+            labels = data_array.coords[dim].to_numpy()
+            # Datetimes read the same as the cells of a datetime column
+            to_str = _datetime64_formatter() if labels.dtype.kind == "M" else str
+            return [to_str(label) for label in labels]
+        return [str(i) for i in range(data_array.sizes[dim])]
+
+
+_ARRAY_DTYPE_KIND_DISPLAY = MappingProxyType(
+    {
+        "b": ColumnDisplayType.Boolean,
+        "i": ColumnDisplayType.Integer,
+        "u": ColumnDisplayType.Integer,
+        "f": ColumnDisplayType.Floating,
+        "M": ColumnDisplayType.Datetime,
+        "U": ColumnDisplayType.String,
+        "S": ColumnDisplayType.String,
+    }
+)
+
+
+def _datetime64_formatter() -> Callable[[Any], str]:
+    """Return a function that formats a numpy datetime64 scalar the way pandas does."""
+    try:
+        import pandas as pd
+    except ImportError:
+        return lambda x: str(x).replace("T", " ")
+    return lambda x: str(pd.Timestamp(x))
+
+
+def _array_summarize_number(
+    values: np.ndarray, options: FormatOptions, display_type=ColumnDisplayType.Floating
+):
+    import numpy as np
+
+    float_format = _get_float_formatter(options)
+    math_helper = NumPyMathHelper()
+
+    min_val = max_val = median_val = mean_val = std_val = None
+    if len(values) > 0:
+        min_val = values.min()
+        max_val = values.max()
+
+        if not math_helper.isinf(min_val) and not math_helper.isinf(max_val):
+            # These stats are not defined when there is an inf/-inf in the data
+            mean_val = float_format(values.mean())
+            median_val = float_format(np.median(values))
+            # Matches pandas, which yields NaN for a single value
+            std_val = float_format(values.std(ddof=1)) if len(values) > 1 else float_format(np.nan)
+
+        if display_type == ColumnDisplayType.Floating:
+            min_val = float_format(min_val)
+            max_val = float_format(max_val)
+        else:
+            min_val = str(min_val)
+            max_val = str(max_val)
+
+    return _box_number_stats(
+        min_val, max_val, mean_val, median_val, std_val, display_type=display_type
+    )
+
+
+def _array_summarize_floating(values: np.ndarray, options: FormatOptions):
+    return _array_summarize_number(values, options, display_type=ColumnDisplayType.Floating)
+
+
+def _array_summarize_integer(values: np.ndarray, options: FormatOptions):
+    return _array_summarize_number(values, options, display_type=ColumnDisplayType.Integer)
+
+
+def _array_summarize_boolean(values: np.ndarray, _options: FormatOptions):
+    true_count = int(values.sum())
+    return _box_boolean_stats(true_count, len(values) - true_count)
+
+
+def _array_summarize_string(values: np.ndarray, _options: FormatOptions):
+    import numpy as np
+
+    num_empty = int(np.sum(np.char.str_len(values) == 0))
+    return _box_string_stats(num_empty, len(np.unique(values)))
+
+
+def _count_objects(values: Iterable[Any]) -> tuple[list[Any], list[int]]:
+    """
+    Count the distinct values of an object column by value equality, in order of first appearance.
+
+    Values do not need to be orderable or hashable. Equal values count as one even when one is
+    hashable and the other is not, e.g. {1} and frozenset({1}). A comparison that raises or does
+    not return a bool counts as not equal.
+    """
+    # Each distinct value, with its count, in order of first appearance
+    uniques: list[Any] = []
+    counts: list[int] = []
+    # Index into uniques of each hashable value seen, for the fast path
+    hashable_index: dict[Any, int] = {}
+    # Indices into uniques of the values that could not go in hashable_index
+    unhashable_indices: list[int] = []
+    for value in values:
+        try:
+            index = hashable_index.get(value)
+            hashable = True
+        except Exception:
+            # Unhashable, or a hash collision whose comparison raised
+            index = None
+            hashable = False
+        if index is None:
+            # Hashable values only need comparing with the values outside the hash table; other
+            # values need comparing with every distinct value
+            candidates = unhashable_indices if hashable else range(len(uniques))
+            match = next((i for i in candidates if _objects_equal(uniques[i], value)), None)
+            if match is None:
+                index = len(uniques)
+                uniques.append(value)
+                counts.append(0)
+            else:
+                index = match
+            # Later equal hashable values then take the fast path
+            cached = hashable and _try_set_item(hashable_index, value, index)
+            if match is None and not cached:
+                unhashable_indices.append(index)
+        counts[index] += 1
+    return uniques, counts
+
+
+def _try_set_item(mapping: dict[Any, int], key: Any, value: int) -> bool:
+    """Set mapping[key] = value, returning False when a comparison of keys raises."""
+    try:
+        mapping[key] = value
+    except Exception:
+        return False
+    return True
+
+
+def _objects_equal(a: Any, b: Any) -> bool:
+    """Whether a == b is True, treating a comparison that raises or is not a bool as unequal."""
+    try:
+        result = a == b
+    except Exception:
+        return False
+    return result is True
+
+
+def _array_summarize_object(values: np.ndarray, _options: FormatOptions):
+    return _box_other_stats(len(_count_objects(values)[0]), type_display=ColumnDisplayType.Object)
+
+
+def _array_summarize_datetime(values: np.ndarray, options: FormatOptions):
+    # Reuse the pandas implementation so that formatting matches PandasView. pandas is optional,
+    # so without it the summary has the column type and no stats.
+    try:
+        import pandas as pd
+    except ImportError:
+        return ColumnSummaryStats(type_display=ColumnDisplayType.Datetime)
+
+    return _pandas_summarize_datetime(pd.Series(values), options)
+
+
+class ArrayView(DataExplorerTableView):
+    """DataExplorer view implementation for 1-D and 2-D numpy, xarray, and dask arrays."""
+
+    table: _ArrayTable
+
+    def __init__(
+        self,
+        table,
+        comm: PositronComm,
+        state: DataExplorerState,
+        job_queue: BackgroundJobQueue,
+        sql_string: str | None = None,
+    ):
+        # For lazy importing NumPy
+        self.math_helper = NumPyMathHelper()
+        super().__init__(_ArrayTable.from_value(table), comm, state, job_queue, sql_string)
+
+    @property
+    def _values(self) -> np.ndarray:
+        return self.table.values  # noqa: PD011
+
+    @property
+    def _has_row_labels(self) -> bool:
+        return self.table.row_labels is not None
+
+    def _get_single_column_schema(self, column_index: int) -> ColumnSchema:
+        return ColumnSchema(
+            column_name=self._get_column_name(column_index),
+            column_label=self.table.column_label(column_index),
+            column_index=column_index,
+            type_name=str(self._values.dtype),
+            type_display=self._get_column_type_display(column_index),
+        )
+
+    def _get_column_name(self, column_index: int) -> str:
+        return self.table.columns[column_index]
+
+    def _get_column_type_display(self, column_index: int) -> ColumnDisplayType:  # noqa: ARG002
+        # Every column of an array has the same dtype
+        kind = self._values.dtype.kind
+        return _ARRAY_DTYPE_KIND_DISPLAY.get(kind, ColumnDisplayType.Object)
+
+    def _get_data_values(
+        self,
+        selections: list[ColumnSelection],
+        format_options: FormatOptions,
+    ) -> dict:
+        np = self.math_helper.np
+
+        kind = self._values.dtype.kind
+        is_nat: Callable[[Any], bool] = np.isnat if kind in "mM" else (lambda _x: False)
+        _format_value = _get_value_formatter(
+            format_options, self.math_helper, is_nat=is_nat, is_na=lambda _x: False
+        )
+        if kind == "M":
+            # Render datetimes the way pandas does, e.g. "2020-01-01 00:00:00"
+            _format_scalar = _format_value
+            _to_timestamp = _datetime64_formatter()
+            _format_value = lambda x: (  # noqa: E731
+                _format_scalar(x) if is_nat(x) else _to_timestamp(x)
+            )
+
+        formatted_columns = []
+        for selection in selections:
+            col = self._values[:, selection.column_index]
+            mask = self._get_mask(selection.column_index)
+            spec = selection.spec
+            if isinstance(spec, DataSelectionRange):
+                rows = slice(spec.first_index, spec.last_index + 1)
+            else:
+                rows = np.asarray(spec.indices, dtype=np.intp)
+            values = col[rows]
+            masked = None if mask is None else mask[rows]
+            formatted = [_format_value(x) for x in values]
+            if masked is not None:
+                formatted = [_VALUE_NA if m else v for v, m in zip(formatted, masked)]
+            formatted_columns.append(formatted)
+
+        # Bypass pydantic model for speed
+        return {"columns": formatted_columns}
+
+    def _get_row_labels(self, selection: ArraySelection, _format_options: FormatOptions):
+        labels = self.table.row_labels
+        if labels is None:
+            return {"row_labels": []}
+        if isinstance(selection, DataSelectionRange):
+            selected = labels[selection.first_index : selection.last_index + 1]
+        else:
+            selected = [labels[i] for i in selection.indices]
+        return {"row_labels": [selected]}
+
+    def get_state(self, _unused):
+        state = super().get_state(_unused)
+        if self.table.dims:
+            state.display_name = f"{self.state.name} ({', '.join(self.table.dims)})"
+        return state
+
+    def get_updated_state(self, new_table) -> StateUpdate:
+        # Arrays have no sort keys or filters to carry over. The schema is unchanged when the
+        # shape, dtype, column names, row labels, dims (which the title names), and the units in
+        # the column labels all match, so only the data needs a refresh.
+        new_table = _ArrayTable.from_value(new_table)
+        old_table = self.table
+        schema_updated = (
+            new_table.shape != old_table.shape
+            or new_table.dtype != old_table.dtype
+            or new_table.columns != old_table.columns
+            or new_table.row_labels != old_table.row_labels
+            or new_table.dims != old_table.dims
+            or new_table.label_units != old_table.label_units
+        )
+        return schema_updated, DataExplorerState(self.state.name)
+
+    def _get_mask(self, column_index: int) -> np.ndarray | None:
+        mask = self.table.mask
+        return None if mask is None else mask[:, column_index]
+
+    def _get_column(self, column_index: int) -> np.ndarray:
+        """Return one column as a 1-D array, a masked array when the table has masked cells."""
+        col = self._values[:, column_index]
+        mask = self._get_mask(column_index)
+        if mask is None:
+            return col
+        return self.math_helper.np.ma.array(col, mask=mask)
+
+    def _get_valid_values(self, column_index: int) -> np.ndarray:
+        """Return a column's values without masked, NaN, NaT, or None cells."""
+        np = self.math_helper.np
+        col = self._get_column(column_index)
+        if isinstance(col, np.ma.MaskedArray):
+            col = col.compressed()
+        if col.dtype.kind in "fcmM":
+            col = col[~np.isnan(col) if col.dtype.kind in "fc" else ~np.isnat(col)]
+        elif col.dtype.kind == "O":
+            # Cells render None and float NaN as missing, so count them as nulls
+            is_float = self.math_helper.is_float_scalar
+            isnan = self.math_helper.isnan
+            valid = [not (x is None or (is_float(x) and isnan(x))) for x in col]
+            col = col[np.asarray(valid, dtype=bool)]
+        return col
+
+    def _prof_null_count(self, column_index: int) -> int:
+        return len(self._values) - len(self._get_valid_values(column_index))
+
+    def _get_summary_values(self, column_index: int) -> np.ndarray:
+        return self._get_valid_values(column_index)
+
+    _SUMMARIZERS = MappingProxyType(
+        {
+            ColumnDisplayType.Boolean: _array_summarize_boolean,
+            ColumnDisplayType.Floating: _array_summarize_floating,
+            ColumnDisplayType.Integer: _array_summarize_integer,
+            ColumnDisplayType.String: _array_summarize_string,
+            ColumnDisplayType.Datetime: _array_summarize_datetime,
+            ColumnDisplayType.Object: _array_summarize_object,
+        }
+    )
+
+    def _format_values(self, values, options: FormatOptions) -> list[ColumnValue]:
+        # Profile values never contain NaT or masked cells
+        if self._values.dtype.kind == "M":
+            _to_timestamp = _datetime64_formatter()
+            return [_to_timestamp(x) for x in values]
+        _format_value = _get_value_formatter(
+            options, self.math_helper, is_nat=lambda _x: False, is_na=lambda _x: False
+        )
+        return [_format_value(x) for x in values]
+
+    def _prof_freq_table(
+        self,
+        column_index: int,
+        params: ColumnFrequencyTableParams,
+        format_options: FormatOptions,
+    ) -> ColumnFrequencyTable:
+        np = self.math_helper.np
+        valid = self._get_valid_values(column_index)
+        if valid.dtype.kind == "O":
+            # Objects may not be orderable, and np.unique sorts. Ties keep first appearance.
+            distinct, object_counts = _count_objects(valid)
+            values = np.empty(len(distinct), dtype=object)
+            values[:] = distinct
+            counts = np.asarray(object_counts, dtype=np.int64)
+        else:
+            # Ties in ascending value order
+            values, counts = np.unique(valid, return_counts=True)
+        # Most frequent first
+        order = np.argsort(-counts, kind="stable")
+        top = order[: params.limit]
+        other = order[params.limit :]
+
+        return ColumnFrequencyTable(
+            values=self._format_values(values[top], format_options),
+            counts=[int(x) for x in counts[top]],
+            other_count=int(counts[other].sum()),
+        )
+
+    def _prof_histogram(
+        self,
+        column_index: int,
+        params: ColumnHistogramParams,
+        format_options: FormatOptions,
+    ) -> ColumnHistogram:
+        np = self.math_helper.np
+
+        data = self._get_valid_values(column_index)
+        dtype = data.dtype
+        is_datetime64 = dtype.kind == "M"
+        if is_datetime64:
+            data = data.view(np.int64)
+
+        method = _get_histogram_method(params.method)
+        bin_counts, bin_edges = _get_histogram_numpy(data, params.num_bins, method=method)
+
+        if is_datetime64:
+            bin_edges = np.floor(bin_edges).astype(np.int64).view(dtype)
+
+        formatted_edges = self._format_values(bin_edges, format_options)
+
+        return ColumnHistogram(
+            bin_edges=[str(x) for x in formatted_edges],
+            bin_counts=[int(x) for x in bin_counts],
+            quantiles=[],
+        )
+
+    # Sorting, filtering, search, export, and code conversion are not supported for arrays
+    FEATURES = SupportedFeatures(
+        search_schema=DataExplorerTableView.FEATURES.search_schema,
+        set_column_filters=DataExplorerTableView.FEATURES.set_column_filters,
+        set_row_filters=DataExplorerTableView.FEATURES.set_row_filters,
+        get_column_profiles=GetColumnProfilesFeatures(
+            support_status=SupportStatus.Supported,
+            supported_types=[
+                ColumnProfileTypeSupportStatus(
+                    profile_type=profile_type,
+                    support_status=SupportStatus.Supported,
+                )
+                for profile_type in (
+                    ColumnProfileType.NullCount,
+                    ColumnProfileType.SummaryStats,
+                    ColumnProfileType.SmallHistogram,
+                    ColumnProfileType.SmallFrequencyTable,
+                )
+            ],
+        ),
+        set_sort_columns=DataExplorerTableView.FEATURES.set_sort_columns,
+        export_data_selection=DataExplorerTableView.FEATURES.export_data_selection,
+        convert_to_code=DataExplorerTableView.FEATURES.convert_to_code,
+    )
+
+
 def _get_table_view(
     table,
     comm: PositronComm,
@@ -2913,6 +3656,8 @@ def _get_table_view(
         return PolarsView(table, comm, state, job_queue)
     elif is_ibis(table):
         return IbisView(table, comm, state, job_queue, sql_string)
+    elif isinstance(table, _ArrayTable) or _is_viewable_array(table):
+        return ArrayView(table, comm, state, job_queue, sql_string)
     else:
         return UnsupportedView(table, comm, state, job_queue)
 
@@ -2922,7 +3667,10 @@ def _value_type_is_supported(value):
         return True
     if is_polars(value):
         return True
-    return bool(is_ibis(value))
+    if is_ibis(value):
+        return True
+    # An _ArrayTable is the table of an open ArrayView, which can open a new explorer for it
+    return isinstance(value, _ArrayTable) or _is_viewable_array(value)
 
 
 class DataExplorerService:
@@ -3145,7 +3893,12 @@ class DataExplorerService:
             # looking at invalid.
             return self._close_explorer(comm_id)
 
-        if not isinstance(new_table, type(table_view.table)):
+        if isinstance(table_view, ArrayView) and _is_viewable_array(new_table):
+            # The open view's table is an _ArrayTable, never the user's array type. Load the new
+            # array once, for both the schema comparison and the new view.
+            new_table = _ArrayTable.from_value(new_table)
+            schema_updated, new_state = table_view.get_updated_state(new_table)
+        elif not isinstance(new_table, type(table_view.table)):
             # Data structure type has changed. For now, we drop the
             # entire state: sorting keys, filters, etc. and start
             # over. At some point we can return here and selectively
