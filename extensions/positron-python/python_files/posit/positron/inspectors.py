@@ -9,6 +9,7 @@ import copy
 import datetime
 import inspect
 import logging
+import math
 import numbers
 import pydoc
 import re
@@ -16,6 +17,7 @@ import sys
 import types
 from abc import ABC, abstractmethod
 from collections.abc import (
+    Hashable,
     Mapping,
     MutableMapping,
     MutableSequence,
@@ -53,6 +55,8 @@ if TYPE_CHECKING:
     import numpy as np
     import pandas as pd
     import polars as pl
+    import xarray as xr
+    from dask.array.core import Array as DaskArray
 
     # temporary suppress for python 3.12
     with contextlib.suppress(ImportError):
@@ -1399,7 +1403,779 @@ class IbisExprInspector(PositronInspector["ibis.Expr"]):
         return get_qualname(self.value)
 
 
+#
+# xarray
+#
+
+_NONE_TEXT = "(none)"
+
+XarrayArray = TypeVar("XarrayArray", "xr.DataArray", "xr.Variable")
+
+_BYTE_UNITS = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+
+
+def _format_nbytes(n: int) -> str:
+    """Format a byte count with binary units, using one decimal above bytes."""
+    if n < 1024:
+        return f"{n} B"
+    size = float(n)
+    unit = 0
+    while size >= 1024 and unit < len(_BYTE_UNITS) - 1:
+        size /= 1024
+        unit += 1
+    return f"{size:.1f} {_BYTE_UNITS[unit]}"
+
+
+def _format_name_list(names: Iterable[Any], *, level: int = 0) -> tuple[str, bool]:
+    """Join names with commas, truncating long lists."""
+    return _maybe_truncate_string(", ".join(str(name) for name in names), level=level)
+
+
+_DASK_ARRAY_QNAMES = (
+    "dask.array.core.Array",
+    # dask's opt-in array query planning uses a separate Array class
+    "dask.array._array_expr._collection.Array",
+)
+
+_DASK_METADATA_LABELS = ("chunks", "nbytes", "graph layers")
+
+
+def _is_dask_array(value: Any) -> bool:
+    return "dask.array" in sys.modules and get_qualname(type(value)) in _DASK_ARRAY_QNAMES
+
+
+def _dask_variables(value: Any) -> list[tuple[tuple[Hashable, ...] | None, DaskArray]]:
+    """
+    Return `(dims, dask array)` for a dask array or each dask-backed variable of an xarray object.
+
+    Covers a Variable, a DataArray's data, and a Dataset's data variables. Bare dask arrays have
+    no dims.
+    """
+    if "dask.array" not in sys.modules:
+        return []
+    if _is_dask_array(value):
+        return [(None, value)]
+    xr_mod = sys.modules.get("xarray")
+    if xr_mod is None:
+        return []
+    if isinstance(value, xr_mod.Variable):
+        variables = [value]
+    elif isinstance(value, xr_mod.DataArray):
+        variables = [value.variable]
+    elif isinstance(value, xr_mod.Dataset):
+        variables = [value.variables[name] for name in value.data_vars]
+    else:
+        return []
+    # `Variable.chunks` reads the wrapped array's chunks without loading anything, and
+    # `Variable.data` returns a chunked array as-is, so neither reads a lazily indexed variable.
+    return [
+        (var.dims, var.data)
+        for var in variables
+        if var.chunks is not None and _is_dask_array(var.data)
+    ]
+
+
+def _is_dask_backed(value: Any) -> bool:
+    """Whether value is a dask array or an xarray object with dask-backed data."""
+    return bool(_dask_variables(value))
+
+
+def _dask_nbytes(array: DaskArray) -> int | None:
+    """The size of a dask array in bytes, or None when its shape is not known until computed."""
+    # A dim's length is NaN when it depends on data that has not been computed
+    size = math.prod(array.shape)
+    return int(size) * array.dtype.itemsize if math.isfinite(size) else None
+
+
+def _first_chunk(chunks: tuple[int, ...]) -> int:
+    # dask's own repr also reports the first chunk of each dim as the chunk size
+    return chunks[0] if chunks else 0
+
+
+def _dask_metadata(value: Any) -> tuple[str, list[tuple[str, str]]]:
+    """
+    Describe the chunk layout of a dask-backed value without computing it.
+
+    Returns a summary such as "61 chunks, 90.2 MiB (lazy)" and ordered (label, text) rows for
+    `chunks`, `nbytes`, and `graph layers`. `nbytes` sums the dask-backed variables only.
+
+    The summary's count depends on the chunk layout:
+
+    - Variables that chunk a shared dim differently: no count ("mixed chunks, ..."), and the
+      `chunks` row reads "mixed (varies by variable)".
+    - A Dataset whose dask variables all have the same number of chunks: that count
+      ("61 chunks per variable, ...").
+    - Otherwise: the total over the dask variables ("5 chunks, ..."), so that the count and
+      the bytes describe the same data.
+    """
+    arrays = _dask_variables(value)
+    sizes = [_dask_nbytes(array) for _, array in arrays]
+    nbytes_text = "unknown" if None in sizes else _format_nbytes(sum(cast("list[int]", sizes)))
+
+    # `numblocks` is each array's chunk grid, read from metadata.
+    counts = [math.prod(array.numblocks) for _, array in arrays]
+    mixed = False
+    if len(arrays) == 1 and arrays[0][0] is None:
+        array = arrays[0][1]
+        chunks_text = str(tuple(_first_chunk(c) for c in array.chunks))
+    else:
+        grid: dict[Hashable, tuple[int, ...]] = {}
+        for dims, array in arrays:
+            for dim, chunks in zip(dims or (), array.chunks):
+                if grid.setdefault(dim, chunks) != chunks:
+                    mixed = True
+        if mixed:
+            chunks_text = "mixed (varies by variable)"
+        else:
+            # Without conflicts, each dim has one chunk size across the variables that use it.
+            dims = [dim for dim in value.sizes if dim in grid]
+            chunks_text = ", ".join(f"{dim}: {_first_chunk(grid[dim])}" for dim in dims)
+
+    graph = value.__dask_graph__()
+    hlg_mod = sys.modules.get("dask.highlevelgraph")
+    if hlg_mod is not None and isinstance(graph, hlg_mod.HighLevelGraph):
+        layers = len(graph.layers)
+    else:
+        layers = 1
+
+    xr_mod = sys.modules.get("xarray")
+    is_dataset = xr_mod is not None and isinstance(value, xr_mod.Dataset)
+    if mixed:
+        summary = f"mixed chunks, {nbytes_text} (lazy)"
+    elif is_dataset and len(set(counts)) == 1:
+        count = counts[0]
+        summary = f"{count} chunk{'' if count == 1 else 's'} per variable, {nbytes_text} (lazy)"
+    else:
+        count = sum(counts)
+        summary = f"{count} chunk{'' if count == 1 else 's'}, {nbytes_text} (lazy)"
+    rows: list[tuple[str, str]] = list(
+        zip(_DASK_METADATA_LABELS, (chunks_text, nbytes_text, str(layers)))
+    )
+    return summary, rows
+
+
+def _attrs_equal(a: Mapping[Any, Any], b: Mapping[Any, Any]) -> bool:
+    try:
+        return bool(a == b)
+    except (ValueError, TypeError):
+        # Attribute values such as numpy arrays do not support bool(x == y)
+        return False
+
+
+# The key of a DataArray's or Variable's own data in `_xarray_variables`. Any hashable, None included, can name
+# an xarray variable, so the key is an object that no user code can pass.
+_OWN_DATA_KEY = object()
+
+
+def _xarray_variables(
+    value: xr.Dataset | xr.DataArray | xr.Variable,
+) -> dict[Hashable, xr.Variable]:
+    """
+    Every variable of an xarray object.
+
+    A DataArray's own data, and a Variable itself, are keyed by `_OWN_DATA_KEY`.
+    """
+    if hasattr(value, "data_vars"):
+        return dict(cast("xr.Dataset", value).variables)
+    if not hasattr(value, "coords"):
+        return {_OWN_DATA_KEY: cast("xr.Variable", value)}
+    array = cast("xr.DataArray", value)
+    variables: dict[Hashable, xr.Variable] = {
+        name: coord.variable for name, coord in array.coords.items()
+    }
+    variables[_OWN_DATA_KEY] = array.variable
+    return variables
+
+
+def _xarray_lazy_equals(a: Any, b: Any) -> bool:
+    """
+    Compare xarray objects when either one is dask-backed, without computing anything.
+
+    Compares structure, names, and attrs; each chunked variable by its dask name (the graph
+    token, which a copy keeps); and every other variable (data variables and coordinates) by
+    value.
+    """
+    if type(a) is not type(b):
+        return False
+    # A Variable has no coordinates and no name
+    coords_a = list(getattr(a, "coords", ()))
+    if dict(a.sizes) != dict(b.sizes) or coords_a != list(getattr(b, "coords", ())):
+        return False
+    if hasattr(a, "data_vars"):
+        if list(a.data_vars) != list(b.data_vars):
+            return False
+    elif getattr(a, "name", None) != getattr(b, "name", None):
+        return False
+    if not _attrs_equal(a.attrs, b.attrs):
+        return False
+
+    vars_a = _xarray_variables(a)
+    vars_b = _xarray_variables(b)
+    if list(vars_a) != list(vars_b):
+        return False
+    for name, var_a in vars_a.items():
+        var_b = vars_b[name]
+        if var_a.dims != var_b.dims or var_a.dtype != var_b.dtype:
+            return False
+        if not _attrs_equal(var_a.attrs, var_b.attrs):
+            return False
+        if var_a.chunks is not None or var_b.chunks is not None:
+            if var_a.chunks is None or var_b.chunks is None:
+                return False
+            if getattr(var_a.data, "name", None) != getattr(var_b.data, "name", None):
+                return False
+        elif not var_a.identical(var_b):
+            return False
+    return True
+
+
+def _xarray_lazy_copy(value: Any) -> Any:
+    """Snapshot a dask-backed xarray object for change detection without computing it."""
+    out = value.copy(deep=False)
+    out.attrs = dict(value.attrs)
+    # A shallow copy shares each dask Array object with the original. Dask's in-place assignment
+    # gives the array it is called on a new name, so a shared object would pass the new name on
+    # to the snapshot too. A shallow copy of each dask Array is a new object with the same name
+    # and graph, and computes nothing.
+    # A shallow copy also shares the buffers of eager variables, so an in-place edit of the
+    # original would show up in the snapshot. Each eager variable other than an index gets a deep
+    # copy. Index variables are immutable.
+    index_variable = sys.modules["xarray"].IndexVariable
+    for name, variable in _xarray_variables(out).items():
+        if variable.chunks is not None and _is_dask_array(variable.data):
+            variable.data = copy.copy(variable.data)
+        elif name is not _OWN_DATA_KEY and not isinstance(variable, index_variable):
+            owned = variable.copy(deep=True)
+            if name in out.coords:
+                out.coords[name] = owned
+            else:
+                out[name] = owned
+    return out
+
+
+def _eager_variable_nbytes(value: Any) -> int:
+    """The bytes of every variable of an xarray object that is not chunked."""
+    return sum(
+        variable.nbytes for variable in _xarray_variables(value).values() if variable.chunks is None
+    )
+
+
+class MetadataRow:
+    """A leaf row of descriptive text shown as a child of an array-like object."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class ArrayGroup:
+    """A group row (for example Coordinates) shown as a child of an array-like object."""
+
+    COORDINATES = "Coordinates"
+    DATA_VARIABLES = "Data variables"
+    ATTRIBUTES = "Attributes"
+    VALUES = "Values"
+    DASK_METADATA = "Dask metadata"
+
+    def __init__(self, name: str, owner: Any) -> None:
+        self.name = name
+        self.owner = owner
+
+
+class MetadataRowInspector(PositronInspector[MetadataRow]):
+    def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:  # noqa: ARG002
+        return self.value.text, False
+
+    def get_display_type(self) -> str:
+        return ""
+
+    def get_kind(self) -> str:
+        return "other"
+
+    def get_length(self) -> int:
+        return 0
+
+    def has_children(self) -> bool:
+        return False
+
+    def get_children(self) -> list[Any]:
+        return []
+
+    def is_mutable(self) -> bool:
+        return False
+
+
+_PREVIEW_THRESHOLD = 100
+_PREVIEW_EDGEITEMS = 3
+
+
+def _edge_values(array: xr.DataArray | xr.Variable) -> np.ndarray:
+    """
+    Read only the leading and trailing items of each dim of a DataArray or Variable.
+
+    Each dim longer than twice the edge items keeps one extra leading item, so that
+    `np.array2string` still elides the middle and shows exactly the edge items. A lazily indexed
+    variable (opened from disk without chunks) then reads a bounded number of elements.
+    """
+    edge = _PREVIEW_EDGEITEMS
+    per_dim = [
+        [slice(0, edge + 1), slice(size - edge, size)] if size > 2 * edge else [slice(None)]
+        for size in array.shape
+    ]
+    variable = getattr(array, "variable", array)
+
+    def block(prefix: tuple[slice, ...]) -> Any:
+        if len(prefix) == array.ndim:
+            return variable[prefix].to_numpy()
+        return [block((*prefix, part)) for part in per_dim[len(prefix)]]
+
+    return _numpy().block(block(()))
+
+
+def _pandas_time_formatter(kind: str) -> Callable[[Any], str] | None:
+    """
+    A function that shows a datetime64 or timedelta64 item as pandas does.
+
+    `kind` is the dtype kind, "M" or "m". The result reads like "2020-01-01 00:00:00". Returns
+    None when pandas has not been imported.
+    """
+    pd_mod = sys.modules.get("pandas")
+    if pd_mod is None:
+        return None
+    convert = pd_mod.Timestamp if kind == "M" else pd_mod.Timedelta
+
+    def format_item(item: Any) -> str:
+        try:
+            return str(convert(item))
+        except (ValueError, OverflowError):
+            # For example, a date outside the range of pandas' nanosecond timestamps.
+            return str(item)
+
+    return format_item
+
+
+def _format_float(value: Any, digits: int) -> str:
+    """
+    A numpy float with at most `digits` significant digits, laid out like Python's "g" format.
+
+    The numpy scalar is formatted as is: a cast to a Python float would lose the range and
+    precision of a longdouble wider than float64. Integral values keep a ".0".
+    """
+    np = _numpy()
+    scientific = np.format_float_scientific(value, precision=digits - 1, unique=True, trim="-")
+    mantissa, _, exponent = scientific.partition("e")
+    if not exponent:
+        # nan or inf
+        return mantissa
+    if -4 <= int(exponent) < digits:
+        text = np.format_float_positional(
+            value, precision=digits, unique=True, fractional=False, trim="-"
+        )
+        return text if any(c in text for c in ".en") else f"{text}.0"
+    return f"{mantissa}e{int(exponent):+03d}"
+
+
+def _preview_item_formatter(dtype: Any) -> Callable[[Any], str]:
+    """
+    A function that formats one item of an array of `dtype` for the values preview.
+
+    Items are not padded to a common width. A float shows the significant digits its dtype
+    resolves (`np.finfo(dtype).precision`): a float32 decoded from a file as 28.019999, one
+    float32 step from 28.02, shows as 28.02.
+    """
+    kind = dtype.kind
+    if kind in "mM":
+        return _pandas_time_formatter(kind) or str
+    if kind == "f":
+        digits = _numpy().finfo(dtype).precision
+        return lambda item: _format_float(item, digits)
+    if kind == "c":
+        digits = _numpy().finfo(dtype).precision
+
+        def format_complex(item: Any) -> str:
+            np = _numpy()
+            # signbit keeps the sign of a negative zero, as numpy shows it
+            sign = "-" if np.signbit(item.imag) else "+"
+            imag = _format_float(np.abs(item.imag), digits)
+            return f"{_format_float(item.real, digits)}{sign}{imag}j"
+
+        return format_complex
+    if kind == "U":
+        return lambda item: repr(str(item))
+
+    def format_other(item: Any) -> str:
+        # Quote strings in object arrays; str() gives numpy scalars their plain form
+        return repr(str(item)) if isinstance(item, str) else str(item)
+
+    return format_other
+
+
+def _array_values_preview(array: xr.DataArray | xr.Variable, *, level: int = 0) -> tuple[str, bool]:
+    """Preview an eager DataArray's or Variable's values, reading only the items shown."""
+    if array.size <= _PREVIEW_THRESHOLD:
+        values = array.to_numpy()
+        threshold = _PREVIEW_THRESHOLD
+    else:
+        values = _edge_values(array)
+        # The array is over the threshold, so always summarize the edge values.
+        threshold = 0
+    # Commas separate the items, as in the pandas Series preview.
+    text = _numpy().array2string(
+        values,
+        threshold=threshold,
+        edgeitems=_PREVIEW_EDGEITEMS,
+        separator=", ",
+        formatter={"all": _preview_item_formatter(values.dtype)},
+    )
+    return _maybe_truncate_string(" ".join(text.split()), level=level)
+
+
+def _is_own_coordinate(array: xr.DataArray, name: Hashable) -> bool:
+    """
+    Whether the coordinate `name` of a DataArray is the DataArray itself.
+
+    The DataArray of a coordinate (for example `ds["time"]`) has itself as a coordinate, and
+    xarray gives both the same Variable object. A distinct coordinate can share the DataArray's
+    name, or even its data, but never its Variable. Nothing is read or computed.
+
+    A dim without a coordinate is not in `array.coords`. Looking it up anyway raises on some
+    xarray versions and builds a default range coordinate of the dim's length on others.
+    """
+    return (
+        name == array.name
+        and name in array.coords
+        and array.coords[name].variable is array.variable
+    )
+
+
+def _coordinate_names(owner: xr.Dataset | xr.DataArray) -> list[Hashable]:
+    """
+    The names listed in the Coordinates group of an xarray object.
+
+    A DataArray omits the coordinate that is the DataArray itself. Listing it would nest the same
+    row inside itself forever.
+    """
+    names = list(owner.coords)
+    xr_mod = sys.modules.get("xarray")
+    if xr_mod is not None and isinstance(owner, xr_mod.DataArray) and owner.name in owner.coords:
+        array = cast("xr.DataArray", owner)
+        names = [name for name in names if not _is_own_coordinate(array, name)]
+    return names
+
+
+class ArrayGroupInspector(PositronInspector[ArrayGroup]):
+    def _names(self) -> list[Any]:
+        group = self.value
+        if group.name == ArrayGroup.COORDINATES:
+            return _coordinate_names(group.owner)
+        if group.name == ArrayGroup.DATA_VARIABLES:
+            return list(group.owner.data_vars)
+        if group.name == ArrayGroup.ATTRIBUTES:
+            return list(group.owner.attrs)
+        if group.name == ArrayGroup.DASK_METADATA:
+            return list(_DASK_METADATA_LABELS)
+        return []
+
+    def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
+        if self.value.name == ArrayGroup.VALUES:
+            return _array_values_preview(self.value.owner, level=level)
+        if self.value.name == ArrayGroup.DASK_METADATA:
+            return _dask_metadata(self.value.owner)[0], False
+        names = self._names()
+        if not names:
+            return _NONE_TEXT, False
+        return _format_name_list(names, level=level)
+
+    def get_display_type(self) -> str:
+        return ""
+
+    def get_kind(self) -> str:
+        return "other"
+
+    def get_length(self) -> int:
+        return len(self._names())
+
+    def has_children(self) -> bool:
+        return self.get_length() > 0
+
+    def get_children(self) -> list[Any]:
+        return self._names()
+
+    def has_child(self, key: Any) -> bool:
+        return key in self._names()
+
+    def get_child(self, key: Any) -> Any:
+        group = self.value
+        if group.name == ArrayGroup.COORDINATES:
+            return group.owner.coords[key]
+        if group.name == ArrayGroup.DATA_VARIABLES:
+            return group.owner[key]
+        if group.name == ArrayGroup.ATTRIBUTES:
+            return group.owner.attrs[key]
+        if group.name == ArrayGroup.DASK_METADATA:
+            return MetadataRow(dict(_dask_metadata(group.owner)[1])[key])
+        raise KeyError(key)
+
+    def is_mutable(self) -> bool:
+        return False
+
+
+class XarrayDatasetInspector(PositronInspector["xr.Dataset"]):
+    CLASS_QNAME = ("xarray.core.dataset.Dataset", "xarray.Dataset")
+
+    DIMENSIONS = "Dimensions"
+    INDEXES = "Indexes"
+
+    def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
+        ds = self.value
+        text = f"[{len(ds.sizes)} dims x {len(ds.data_vars)} vars] xarray.Dataset"
+        if _is_dask_backed(ds):
+            text += " (dask)"
+        return _maybe_truncate_string(text, level=level)[0], True
+
+    def get_display_type(self) -> str:
+        ds = self.value
+        return f"Dataset [{len(ds.sizes)} dims x {len(ds.data_vars)} vars]"
+
+    def get_kind(self) -> str:
+        return "table"
+
+    def get_length(self) -> int:
+        # The Variables pane treats the length as the child count, and adds a "more values"
+        # row when it is larger than the number of children it receives.
+        return len(self.get_children())
+
+    def get_size(self) -> int:
+        return self.value.nbytes
+
+    def has_children(self) -> bool:
+        return True
+
+    def get_children(self) -> list[str]:
+        children = [
+            self.DIMENSIONS,
+            ArrayGroup.COORDINATES,
+            ArrayGroup.DATA_VARIABLES,
+            self.INDEXES,
+            ArrayGroup.ATTRIBUTES,
+        ]
+        if _is_dask_backed(self.value):
+            children.append(ArrayGroup.DASK_METADATA)
+        return children
+
+    def has_child(self, key: Any) -> bool:
+        return key in self.get_children()
+
+    def get_child(self, key: Any) -> Any:
+        ds = self.value
+        if key == self.DIMENSIONS:
+            text = ", ".join(f"{dim}: {size}" for dim, size in ds.sizes.items())
+            return MetadataRow(text or _NONE_TEXT)
+        if key == self.INDEXES:
+            return MetadataRow(_format_name_list(ds.indexes)[0] or _NONE_TEXT)
+        if key in self.get_children():
+            return ArrayGroup(key, ds)
+        raise KeyError(key)
+
+    def get_comparison_cost(self) -> int:
+        if _is_dask_backed(self.value):
+            return _eager_variable_nbytes(self.value)
+        return self.value.nbytes
+
+    def equals(self, value: xr.Dataset) -> bool:
+        if _is_dask_backed(self.value) or _is_dask_backed(value):
+            return _xarray_lazy_equals(self.value, value)
+        return type(value) is type(self.value) and self.value.identical(value)
+
+    def deepcopy(self) -> xr.Dataset:
+        if _is_dask_backed(self.value):
+            return _xarray_lazy_copy(self.value)
+        return self.value.copy(deep=True)
+
+    def to_html(self) -> str:
+        return self.value._repr_html_()
+
+    def to_plaintext(self) -> str:
+        return repr(self.value)
+
+
+class _XarrayArrayInspector(PositronInspector[XarrayArray], ABC):
+    """Shared behavior of the DataArray and Variable inspectors."""
+
+    def _type_name(self) -> str:
+        return type(self.value).__name__
+
+    def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
+        array = self.value
+        if array.ndim == 0:
+            shape = "scalar"
+        else:
+            shape = " x ".join(f"{dim}: {size}" for dim, size in zip(array.dims, array.shape))
+        text = f"[{shape}] xarray.{self._type_name()}"
+        if _is_dask_backed(array):
+            text += " (dask)"
+        return _maybe_truncate_string(text, level=level)[0], True
+
+    def get_display_type(self) -> str:
+        array = self.value
+        shape = "x".join(str(size) for size in array.shape) if array.ndim > 0 else "scalar"
+        return f"{self._type_name()} [{shape}] {array.dtype}"
+
+    def get_kind(self) -> str:
+        return "table"
+
+    def get_length(self) -> int:
+        # The Variables pane treats the length as the child count, and adds a "more values"
+        # row when it is larger than the number of children it receives.
+        return len(self.get_children())
+
+    def get_size(self) -> int:
+        return self.value.nbytes
+
+    def has_children(self) -> bool:
+        return self.get_length() > 0
+
+    @abstractmethod
+    def get_children(self) -> list[str]:
+        pass
+
+    def _is_bare_scalar(self) -> bool:
+        """Whether the array is 0-D, eager, and without attrs: its display says everything."""
+        array = self.value
+        return array.ndim == 0 and len(array.attrs) == 0 and not _is_dask_backed(array)
+
+    def _data_children(self) -> list[str]:
+        """The Attributes, Values, and Dask metadata rows."""
+        children = [ArrayGroup.ATTRIBUTES]
+        # A chunked (dask) array has no values preview, since building one would compute.
+        if self.value.chunks is None:
+            children.append(ArrayGroup.VALUES)
+        if _is_dask_backed(self.value):
+            children.append(ArrayGroup.DASK_METADATA)
+        return children
+
+    def has_child(self, key: Any) -> bool:
+        return key in self.get_children()
+
+    def get_child(self, key: Any) -> Any:
+        if key in self.get_children():
+            return ArrayGroup(key, self.value)
+        raise KeyError(key)
+
+    def get_comparison_cost(self) -> int:
+        if _is_dask_backed(self.value):
+            return _eager_variable_nbytes(self.value)
+        return self.value.nbytes
+
+    def equals(self, value: XarrayArray) -> bool:
+        if _is_dask_backed(self.value) or _is_dask_backed(value):
+            return _xarray_lazy_equals(self.value, value)
+        return type(value) is type(self.value) and self.value.identical(value)
+
+    def deepcopy(self) -> XarrayArray:
+        if _is_dask_backed(self.value):
+            return _xarray_lazy_copy(self.value)
+        return self.value.copy(deep=True)
+
+    def to_plaintext(self) -> str:
+        return repr(self.value)
+
+
+class XarrayDataArrayInspector(_XarrayArrayInspector["xr.DataArray"]):
+    CLASS_QNAME = ("xarray.core.dataarray.DataArray", "xarray.DataArray")
+
+    def _type_name(self) -> str:
+        return "DataArray"
+
+    def get_children(self) -> list[str]:
+        da = self.value
+        if len(da.coords) == 0 and self._is_bare_scalar():
+            return []
+        children: list[str] = []
+        # A coordinate's own DataArray hides the group when it is the only coordinate.
+        # Without coordinates at all, the group stays and shows "(none)".
+        if len(da.coords) == 0 or _coordinate_names(da):
+            children.append(ArrayGroup.COORDINATES)
+        return children + self._data_children()
+
+    def to_html(self) -> str:
+        return self.value._repr_html_()
+
+
+class XarrayVariableInspector(_XarrayArrayInspector["xr.Variable"]):
+    """
+    An xarray Variable, such as an item of `Dataset.variables`.
+
+    A Variable has dims, data, and attrs, without coordinates or a name. The display names the
+    class, Variable or IndexVariable.
+    """
+
+    CLASS_QNAME = (
+        "xarray.core.variable.Variable",
+        "xarray.Variable",
+        "xarray.core.variable.IndexVariable",
+        "xarray.IndexVariable",
+    )
+
+    def get_children(self) -> list[str]:
+        if self._is_bare_scalar():
+            return []
+        return self._data_children()
+
+
+class DaskArrayInspector(PositronInspector["DaskArray"]):
+    CLASS_QNAME = _DASK_ARRAY_QNAMES
+
+    def get_display_type(self) -> str:
+        array = self.value
+        shape = "x".join(str(size) for size in array.shape) if array.ndim > 0 else "scalar"
+        return f"{type(array).__name__} [{shape}] {array.dtype}"
+
+    def get_kind(self) -> str:
+        return "table"
+
+    def get_length(self) -> int:
+        # The Variables pane treats the length as the child count, and adds a "more values"
+        # row when it is larger than the number of children it receives.
+        return len(self.get_children())
+
+    def get_size(self) -> int:
+        return _dask_nbytes(self.value) or 0
+
+    def has_children(self) -> bool:
+        return True
+
+    def get_children(self) -> list[str]:
+        return [ArrayGroup.DASK_METADATA]
+
+    def has_child(self, key: Any) -> bool:
+        return key == ArrayGroup.DASK_METADATA
+
+    def get_child(self, key: Any) -> Any:
+        if key == ArrayGroup.DASK_METADATA:
+            return ArrayGroup(key, self.value)
+        raise KeyError(key)
+
+    def get_comparison_cost(self) -> int:
+        return 0
+
+    def equals(self, value: DaskArray) -> bool:
+        # The name is a token of the array's task graph; changing the array changes it.
+        return type(value) is type(self.value) and value.name == self.value.name
+
+    def deepcopy(self) -> DaskArray:
+        # A shallow copy shares the task graph and keeps the name, without computing anything.
+        # In-place assignment then gives the original a new name.
+        return copy.copy(self.value)
+
+
 INSPECTOR_CLASSES: dict[str, type[PositronInspector]] = {
+    # xarray inspectors and their child rows
+    **dict.fromkeys(XarrayDatasetInspector.CLASS_QNAME, XarrayDatasetInspector),
+    **dict.fromkeys(XarrayDataArrayInspector.CLASS_QNAME, XarrayDataArrayInspector),
+    **dict.fromkeys(XarrayVariableInspector.CLASS_QNAME, XarrayVariableInspector),
+    **dict.fromkeys(DaskArrayInspector.CLASS_QNAME, DaskArrayInspector),
+    get_qualname(MetadataRow): MetadataRowInspector,
+    get_qualname(ArrayGroup): ArrayGroupInspector,
     # Geopandas inspectors (before pandas to take precedence)
     **dict.fromkeys(GeoDataFrameInspector.CLASS_QNAME, GeoDataFrameInspector),
     **dict.fromkeys(GeoSeriesInspector.CLASS_QNAME, GeoSeriesInspector),
