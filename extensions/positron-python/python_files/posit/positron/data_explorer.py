@@ -114,6 +114,10 @@ from .data_explorer_comm import (
 from .inspectors import (
     _dask_nbytes,
     _dask_variables,
+    _fits_data_readable,
+    _fits_header_int,
+    _fits_image_dims,
+    _fits_image_read_nbytes,
     _format_name_list,
     _format_nbytes,
     _hyperspy_array_axes,
@@ -121,7 +125,10 @@ from .inspectors import (
     _hyperspy_text,
     _hyperspy_title,
     _is_dask_array,
+    _is_fits_hdu,
+    _is_fits_image_hdu,
     _is_hyperspy_signal,
+    _is_nddata,
     _is_own_coordinate,
     _is_stored_array,
     _stored_array_dims,
@@ -2947,7 +2954,7 @@ class IbisView(PandasView):
 
 # ----------------------------------------------------------------------
 # Array Data Explorer RPC implementations for 1-D and 2-D numpy, xarray, dask, zarr, and h5py
-# arrays, and HyperSpy signals
+# arrays, HyperSpy signals, astropy NDData, and FITS image HDUs
 
 # Opening an array view loads its values into memory. That computes a dask-backed array and reads
 # a lazily indexed one (for example a variable opened from a file without chunks), a zarr array, or
@@ -3010,9 +3017,18 @@ def _is_viewable_array(value: Any) -> bool:
     """
     Whether value is one of the arrays that _is_array accepts, with 1 or 2 dims.
 
-    A HyperSpy signal is viewable when its data is, so with 1 or 2 axes in all.
+    A HyperSpy signal or an astropy NDData is viewable when its data is, and so is a FITS image
+    HDU whose data has been read. Another FITS image HDU is checked against its header, without
+    reading its data.
     """
-    if _is_hyperspy_signal(value):
+    if _is_fits_image_hdu(value) and not getattr(value, "_data_loaded", False):
+        header = value.header
+        return (
+            _fits_header_int(header, "NAXIS") in (1, 2)
+            and _fits_data_readable(value)
+            and _fits_image_read_nbytes(header) <= ARRAY_VIEW_MAX_LAZY_BYTES
+        )
+    if _is_hyperspy_signal(value) or _is_nddata(value) or _is_fits_image_hdu(value):
         value = value.data
     if not _is_array(value) or value.ndim not in (1, 2):
         return False
@@ -3050,15 +3066,16 @@ def _array_view_unavailable_message(value: Any, expr: str) -> str | None:
                 f"{_format_name_list(names)[0]}"
             )
         return f"{expr} is an xarray Dataset; view one of its variables, e.g. {command}"
-    signal = value if _is_hyperspy_signal(value) else None
-    if signal is not None:
-        # A signal opens as its data, so the data decides whether it can be viewed
-        value = signal.data
+    wrapper = None
+    if _is_hyperspy_signal(value) or _is_nddata(value) or _is_fits_image_hdu(value):
+        # These open as their data, so the data decides whether they can be viewed
+        wrapper = value
+        value = value.data
     if not _is_array(value):
         return None
     if value.ndim > 2:
         example = (
-            None if node is None else _slice_example(value if signal is None else signal, node)
+            None if node is None else _slice_example(value if wrapper is None else wrapper, node)
         )
         suggestion = "." if example is None else f", e.g. {example}"
         return (
@@ -3118,6 +3135,10 @@ def _slice_example(value: Any, node: ast.expr) -> str | None:
         attr = "inav" if value.axes_manager.navigation_dimension > 0 else "isig"
         indexer = ast.Attribute(value=node, attr=attr, ctx=ast.Load())
         return ast.unparse(ast.Subscript(value=indexer, slice=ast.Constant(0), ctx=ast.Load()))
+    if _is_fits_hdu(value) or (_is_nddata(value) and not hasattr(type(value), "__getitem__")):
+        # An HDU, and an NDData without slicing (such as a plain NDData), slice their data
+        data = ast.Attribute(value=node, attr="data", ctx=ast.Load())
+        return ast.unparse(ast.Subscript(value=data, slice=ast.Constant(0), ctx=ast.Load()))
     xr_module = sys.modules.get("xarray")
     if xr_module is None or not isinstance(value, (xr_module.DataArray, xr_module.Variable)):
         return ast.unparse(ast.Subscript(value=node, slice=ast.Constant(0), ctx=ast.Load()))
@@ -3208,6 +3229,20 @@ class _ArrayTable:
         xr_module = sys.modules.get("xarray")
         if _is_hyperspy_signal(value):
             return cls._from_hyperspy_signal(value)
+        if _is_fits_image_hdu(value):
+            image = cls._from_fits_image(value)
+            if image is not None:
+                return image
+            # Without a CTYPE for every dim, the image opens like a numpy array.
+            value = np.asarray(value.data)
+        if _is_nddata(value):
+            data = np.asarray(value.data)
+            # Masked cells show as missing. NDData allows a mask that broadcasts to the data.
+            value = (
+                data
+                if value.mask is None
+                else np.ma.MaskedArray(data, mask=np.broadcast_to(value.mask, data.shape))
+            )
         if _is_stored_array(value):
             stored = cls._from_stored_array(value)
             if stored is not None:
@@ -3292,9 +3327,34 @@ class _ArrayTable:
         stored_dims = _stored_array_dims(value)
         if stored_dims is None:
             return None
-        dims = tuple(stored_dims)
-        name = _stored_array_name(value)
-        values = np.asarray(value[...])
+        return cls._from_named_dims(
+            np.asarray(value[...]), tuple(stored_dims), _stored_array_name(value)
+        )
+
+    @classmethod
+    def _from_fits_image(cls, hdu: Any) -> _ArrayTable | None:
+        """
+        The table of a FITS image HDU whose CTYPEn keywords name every dim, else None.
+
+        The grid numbers the rows and columns, and the corner names the dims, such as "DEC--TAN"
+        for the rows and "RA---TAN" for the columns.
+        """
+        import numpy as np
+
+        dims = _fits_image_dims(hdu.header)
+        if dims is None:
+            return None
+        return cls._from_named_dims(np.asarray(hdu.data), tuple(dims), hdu.name or None)
+
+    @classmethod
+    def _from_named_dims(
+        cls, values: np.ndarray, dims: tuple[str, ...], name: str | None
+    ) -> _ArrayTable:
+        """
+        The table of values with named dims and no coordinates, like that of an xarray Variable.
+
+        The grid numbers the rows and columns, and the corner names the dims.
+        """
         if values.ndim == 1:
             columns = ["0" if name is None else name]
             values = values.reshape(-1, 1)
