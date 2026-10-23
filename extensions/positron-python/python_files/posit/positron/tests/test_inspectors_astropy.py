@@ -23,8 +23,10 @@ from positron.inspectors import (
 )
 from positron.variables import _resolve_value_from_path, _summarize_children
 
+from .utils import importorskip_astropy
+
 # astropy defines its units at import, so a type checker cannot see them.
-u: Any = pytest.importorskip("astropy.units")
+u: Any = importorskip_astropy("astropy.units")
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -33,7 +35,7 @@ if TYPE_CHECKING:
     from astropy.nddata import CCDData, NDData, StdDevUncertainty
     from astropy.wcs import WCS
 else:
-    fits = pytest.importorskip("astropy.io.fits")
+    fits = importorskip_astropy("astropy.io.fits")
     from astropy.nddata import CCDData, NDData, StdDevUncertainty
     from astropy.wcs import WCS
 

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -18,6 +19,18 @@ if TYPE_CHECKING:
 
     from positron._vendor.pydantic import BaseModel
     from positron.utils import JsonData, JsonRecord
+
+
+def importorskip_astropy(modname: str) -> Any:
+    """
+    Import an astropy module, or skip the test when it cannot be imported.
+
+    astropy 6.0, the last release for Python 3.9, raises AttributeError at import with numpy 2.
+    """
+    try:
+        return importlib.import_module(modname)
+    except (ImportError, AttributeError) as error:
+        pytest.skip(f"could not import {modname}: {error}", allow_module_level=True)
 
 
 def assert_pydantic_model_equal(actual: BaseModel, expected: BaseModel, exclude: set[str]) -> None:

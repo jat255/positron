@@ -39,7 +39,7 @@ from .test_data_explorer import (
     _get_null_count,
     _profile_request,
 )
-from .utils import json_rpc_request, make_dataset
+from .utils import importorskip_astropy, json_rpc_request, make_dataset
 
 if TYPE_CHECKING:
     from .conftest import DummyComm
@@ -1108,14 +1108,14 @@ def test_array_view_hyperspy_non_uniform_axis(dxf: DataExplorerFixture):
 
 
 def test_array_view_quantity(dxf: DataExplorerFixture):
-    u = pytest.importorskip("astropy.units")
+    u = importorskip_astropy("astropy.units")
     q = np.arange(6.0).reshape(2, 3) * u.km
     dxf.register_table("q", q)
     assert _column_values(dxf, "q", 1, 2) == ["1.00", "4.00"]
 
 
 def test_array_view_nddata_mask(dxf: DataExplorerFixture):
-    nddata_mod = pytest.importorskip("astropy.nddata")
+    nddata_mod = importorskip_astropy("astropy.nddata")
     ccd = nddata_mod.CCDData(
         np.arange(6.0).reshape(3, 2), unit="adu", mask=np.array([[False, True]] * 3)
     )
@@ -1127,7 +1127,7 @@ def test_array_view_nddata_mask(dxf: DataExplorerFixture):
 
 
 def test_array_view_fits_image(dxf: DataExplorerFixture, tmp_path):
-    fits = pytest.importorskip("astropy.io.fits")
+    fits = importorskip_astropy("astropy.io.fits")
     header = fits.Header()
     header["CTYPE1"] = "RA---TAN"
     header["CTYPE2"] = "DEC--TAN"
@@ -1150,8 +1150,8 @@ def test_array_view_fits_image(dxf: DataExplorerFixture, tmp_path):
 
 
 def test_array_view_astropy_unavailable_messages():
-    nddata_mod = pytest.importorskip("astropy.nddata")
-    fits = pytest.importorskip("astropy.io.fits")
+    nddata_mod = importorskip_astropy("astropy.nddata")
+    fits = importorskip_astropy("astropy.io.fits")
     cube = np.zeros((2, 3, 4))
     assert _array_view_unavailable_message(nddata_mod.NDData(cube), "nd") == (
         "nd has 3 dimensions; the Data Explorer shows 1-D and 2-D arrays. "
