@@ -754,16 +754,17 @@ class NumpyNdarrayInspector(_BaseArrayInspector["np.ndarray"]):
     def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
         if level >= len(MAX_ITEMS_BY_LEVEL):
             return f"numpy.array({ELLIPSIS})", True
-        return (
-            _numpy().array2string(
-                self.value,
-                max_line_width=ARRAY_MAX_LINE_WIDTH,
-                threshold=ARRAY_THRESHOLD,
-                edgeitems=ARRAY_EDGEITEMS,
-                separator=",",
-            ),
-            True,
+        # Items are formatted as in the xarray values preview, without padding to a common width,
+        # and the lines of a 2-D array are joined, since the Variables pane shows one line.
+        text = _numpy().array2string(
+            self.value,
+            max_line_width=ARRAY_MAX_LINE_WIDTH,
+            threshold=ARRAY_THRESHOLD,
+            edgeitems=ARRAY_EDGEITEMS,
+            separator=", ",
+            formatter={"all": _preview_item_formatter(self.value.dtype)},
         )
+        return " ".join(text.split()), True
 
     def equals(self, value: np.ndarray) -> bool:
         return _numpy().array_equal(self.value, value)
@@ -1937,6 +1938,52 @@ class ArrayGroupInspector(PositronInspector[ArrayGroup]):
         return False
 
 
+# Protocols of fsspec filesystems and URLs whose data is on this machine
+_LOCAL_PROTOCOLS = frozenset({"file", "local", "memory"})
+# A URL scheme, such as "https://" or "s3://". A Windows path, such as C:\data, has none.
+_URL_SCHEME = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]+)://")
+# Remote stores of zarr's ObjectStore, which wraps an obstore store
+_OBSTORE_REMOTE_STORES = frozenset({"AzureStore", "GCSStore", "HTTPStore", "S3Store"})
+
+
+def _is_remote_url(source: Any) -> bool:
+    """
+    Whether source is the URL of data on another machine, such as "https://..." or "s3://...".
+
+    A chained fsspec URL, such as "simplecache::s3://...", is remote when its last part is.
+    """
+    if not isinstance(source, str):
+        return False
+    match = _URL_SCHEME.match(source.split("::")[-1])
+    return match is not None and match.group(1).lower() not in _LOCAL_PROTOCOLS
+
+
+def _zarr_is_remote(node: Any) -> bool:
+    """Whether a zarr array or group is stored on another machine, read without any I/O."""
+    store = node.store
+    # FsspecStore (zarr 3) and FSStore (zarr 2) name their filesystem's protocols.
+    fs = getattr(store, "fs", None)
+    if fs is not None:
+        protocols = fs.protocol if isinstance(fs.protocol, (list, tuple)) else (fs.protocol,)
+        return not _LOCAL_PROTOCOLS.intersection(protocols)
+    return type(getattr(store, "store", None)).__name__ in _OBSTORE_REMOTE_STORES
+
+
+def _xarray_flags(value: Any) -> str:
+    """
+    The suffix of an xarray object's display value, such as " (dask, remote)", or "".
+
+    "remote" means that xarray opened it from a URL, which it records as the "source" encoding.
+    Variables selected from a Dataset do not have that encoding.
+    """
+    flags = []
+    if _is_dask_backed(value):
+        flags.append("dask")
+    if _is_remote_url(getattr(value, "encoding", {}).get("source")):
+        flags.append("remote")
+    return f" ({', '.join(flags)})" if flags else ""
+
+
 class XarrayDatasetInspector(PositronInspector["xr.Dataset"]):
     CLASS_QNAME = ("xarray.core.dataset.Dataset", "xarray.Dataset")
 
@@ -1946,8 +1993,7 @@ class XarrayDatasetInspector(PositronInspector["xr.Dataset"]):
     def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
         ds = self.value
         text = f"[{len(ds.sizes)} dims x {len(ds.data_vars)} vars] xarray.Dataset"
-        if _is_dask_backed(ds):
-            text += " (dask)"
+        text += _xarray_flags(ds)
         return _maybe_truncate_string(text, level=level)[0], True
 
     def get_display_type(self) -> str:
@@ -2029,8 +2075,7 @@ class _XarrayArrayInspector(PositronInspector[XarrayArray], ABC):
         else:
             shape = " x ".join(f"{dim}: {size}" for dim, size in zip(array.dims, array.shape))
         text = f"[{shape}] xarray.{self._type_name()}"
-        if _is_dask_backed(array):
-            text += " (dask)"
+        text += _xarray_flags(array)
         return _maybe_truncate_string(text, level=level)[0], True
 
     def get_display_type(self) -> str:
@@ -2192,12 +2237,391 @@ class DaskArrayInspector(PositronInspector["DaskArray"]):
         return copy.copy(self.value)
 
 
+#
+# zarr and h5py
+#
+
+# The key of a group's Attributes row. zarr and HDF5 name group members with strings, so an int
+# key never collides with a member.
+_GROUP_ATTRIBUTES_KEY = 0
+
+_ZARR_ARRAY_QNAMES = ("zarr.core.array.Array", "zarr.core.Array")  # zarr 3, zarr 2
+_ZARR_GROUP_QNAMES = ("zarr.core.group.Group", "zarr.hierarchy.Group")  # zarr 3, zarr 2
+_H5PY_DATASET_QNAMES = ("h5py._hl.dataset.Dataset",)
+_H5PY_GROUP_QNAMES = ("h5py._hl.files.File", "h5py._hl.group.Group")
+
+
+def _shape_text(shape: tuple[int, ...], dims: Sequence[Any] | None) -> str:
+    """A shape such as "time: 366 x lat: 140 x lon: 220", or "366 x 140 x 220" without dim names."""
+    if len(shape) == 0:
+        return "scalar"
+    if dims is not None and len(dims) == len(shape):
+        return " x ".join(f"{dim}: {size}" for dim, size in zip(dims, shape))
+    return " x ".join(str(size) for size in shape)
+
+
+def _count(n: int, noun: str) -> str:
+    """A count with its noun, such as "1 chunk" or "61 chunks"."""
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+def _zarr_dims(array: Any) -> list[str] | None:
+    """The dim names of a zarr array, or None when the store does not name every dim."""
+    # zarr format 3 names dims in the array metadata. xarray names them in an attribute when it
+    # writes zarr format 2.
+    names = getattr(getattr(array, "metadata", None), "dimension_names", None)
+    if names is None:
+        names = array.attrs.get("_ARRAY_DIMENSIONS")
+    return _valid_dims(names, array.ndim)
+
+
+def _valid_dims(names: Any, ndim: int) -> list[str] | None:
+    """
+    Check dim names read from metadata, which any writer can set, such as a zarr attribute.
+
+    Returns the names as a list when there is one distinct, non-empty string per dim of an array
+    with ndim dims, else None.
+    """
+    if not isinstance(names, (list, tuple)) or len(names) != ndim:
+        return None
+    if not all(isinstance(name, str) and name for name in names):
+        return None
+    if len(set(names)) != len(names):
+        return None
+    return list(names)
+
+
+def _h5py_dims(dataset: Any) -> list[str] | None:
+    """The dim names of an h5py dataset, or None when the file does not name every dim."""
+    # An anonymous dataset, not linked into the file, has no name.
+    if dataset.name and dataset.ndim == 1 and sys.modules["h5py"].h5ds.is_scale(dataset.id):
+        # A 1-D dimension scale, such as a netCDF4 coordinate, names the dim it measures.
+        return [dataset.name.rsplit("/", 1)[-1]]
+    names = []
+    for dim in dataset.dims:
+        # A dim is named by its label, or else by its dimension scale, as in netCDF4 files.
+        scales = dim.values()
+        name = dim.label or (scales[0].name.rsplit("/", 1)[-1] if scales else None)
+        names.append(name)
+    return _valid_dims(names, dataset.ndim)
+
+
+def _is_stored_array(value: Any) -> bool:
+    """Whether value is a zarr array or an h5py dataset of an open file."""
+    qualname = get_qualname(type(value))
+    if qualname in _ZARR_ARRAY_QNAMES:
+        return True
+    # A dataset of a closed file is falsy.
+    return qualname in _H5PY_DATASET_QNAMES and bool(value)
+
+
+def _stored_array_dims(value: Any) -> list[str] | None:
+    """The dim names of a zarr array or an h5py dataset, or None when not every dim is named."""
+    if get_qualname(type(value)) in _ZARR_ARRAY_QNAMES:
+        return _zarr_dims(value)
+    return _h5py_dims(value)
+
+
+def _stored_array_name(value: Any) -> str | None:
+    """The last part of the path of a zarr array or an h5py dataset, or None when it has none."""
+    # An anonymous h5py dataset has no name, and an array at the root of a store has no last part.
+    basename = (value.name or "").rsplit("/", 1)[-1]
+    return basename or None
+
+
+class _StoredArrayInspector(PositronInspector[Any], ABC):
+    """
+    Shared behavior of an array in a zarr store or an HDF5 file.
+
+    Every row reads metadata only. The values stay in the store, which can be large, compressed,
+    or remote.
+    """
+
+    LIBRARY: str
+    CHUNKS = "Chunks"
+    COMPRESSION = "Compression"
+
+    def _is_open(self) -> bool:
+        return True
+
+    def _is_remote(self) -> bool:
+        return False
+
+    @abstractmethod
+    def _dims(self) -> list[str] | None:
+        """The dim names, or None when the store does not name every dim."""
+
+    @abstractmethod
+    def _metadata(self) -> dict[str, str]:
+        """The text of each metadata row, keyed by the row's name, in display order."""
+
+    def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
+        array = self.value
+        if not self._is_open():
+            return repr(array), False
+        text = f"[{_shape_text(array.shape, self._dims())}] {self.LIBRARY}.{type(array).__name__}"
+        if self._is_remote():
+            text += " (remote)"
+        return _maybe_truncate_string(text, level=level)[0], True
+
+    def get_display_type(self) -> str:
+        array = self.value
+        if not self._is_open():
+            return type(array).__name__
+        shape = "x".join(str(size) for size in array.shape) if array.shape else "scalar"
+        return f"{type(array).__name__} [{shape}] {array.dtype}"
+
+    def get_kind(self) -> str:
+        return "table"
+
+    def has_viewer(self) -> bool:
+        return _has_array_viewer(self.value)
+
+    def get_length(self) -> int:
+        # The Variables pane treats the length as the child count, and adds a "more values"
+        # row when it is larger than the number of children it receives.
+        return len(self.get_children())
+
+    def get_size(self) -> int:
+        # The size of the values once read, which is neither the bytes in memory nor in the store.
+        return self.value.nbytes if self._is_open() else 0
+
+    def has_children(self) -> bool:
+        return self.get_length() > 0
+
+    def get_children(self) -> list[str]:
+        if not self._is_open():
+            return []
+        return [ArrayGroup.ATTRIBUTES, *self._metadata()]
+
+    def has_child(self, key: Any) -> bool:
+        return key in self.get_children()
+
+    def get_child(self, key: Any) -> Any:
+        if key == ArrayGroup.ATTRIBUTES:
+            return ArrayGroup(key, self.value)
+        metadata = self._metadata()
+        if key in metadata:
+            return MetadataRow(metadata[key])
+        raise KeyError(key)
+
+    def to_plaintext(self) -> str:
+        return repr(self.value)
+
+
+class _StoredGroupInspector(PositronInspector[Any], ABC):
+    """Shared behavior of a group in a zarr store or an HDF5 file, listing its members."""
+
+    LIBRARY: str
+
+    def __init__(self, value: Any) -> None:
+        super().__init__(value)
+        self._member_names: list[str] | None = None
+
+    def _is_open(self) -> bool:
+        return True
+
+    def _is_remote(self) -> bool:
+        return False
+
+    def _members(self) -> list[str]:
+        # Listing a remote zarr store without consolidated metadata takes a request, so the
+        # inspector lists the members once, for the row and all its children.
+        if self._member_names is None:
+            self._member_names = list(self.value.keys())
+        return self._member_names
+
+    def _member(self, name: str) -> Any:
+        """The member called name, read without listing the group. Raises KeyError if missing."""
+        return self.value[name]
+
+    def get_display_name(self, key: Any) -> str:
+        if type(key) is int and key == _GROUP_ATTRIBUTES_KEY:
+            return ArrayGroup.ATTRIBUTES
+        return str(key)
+
+    def get_display_value(self, *, level: int = 0) -> tuple[str, bool]:
+        group = self.value
+        if not self._is_open():
+            return repr(group), False
+        text = f"[{_count(len(self._members()), 'member')}] {self.LIBRARY}.{type(group).__name__}"
+        if self._is_remote():
+            text += " (remote)"
+        return _maybe_truncate_string(text, level=level)[0], True
+
+    def get_display_type(self) -> str:
+        if not self._is_open():
+            return type(self.value).__name__
+        return f"{type(self.value).__name__} [{_count(len(self._members()), 'member')}]"
+
+    def get_kind(self) -> str:
+        return "table"
+
+    def get_length(self) -> int:
+        # The Variables pane treats the length as the child count, and adds a "more values"
+        # row when it is larger than the number of children it receives.
+        return len(self.get_children())
+
+    def has_children(self) -> bool:
+        return self.get_length() > 0
+
+    def get_children(self) -> list[Any]:
+        if not self._is_open():
+            return []
+        return [_GROUP_ATTRIBUTES_KEY, *self._members()]
+
+    def has_child(self, key: Any) -> bool:
+        return key in self.get_children()
+
+    def get_child(self, key: Any) -> Any:
+        if type(key) is int and key == _GROUP_ATTRIBUTES_KEY:
+            return ArrayGroup(ArrayGroup.ATTRIBUTES, self.value)
+        if isinstance(key, str):
+            return self._member(key)
+        raise KeyError(key)
+
+    def to_plaintext(self) -> str:
+        return repr(self.value)
+
+
+def _zarr_location(node: Any) -> str:
+    """Where a zarr array or group is stored, such as a URL or a directory, without any I/O."""
+    store = node.store
+    # FsspecStore (remote, zarr 3) and DirectoryStore (zarr 2) name their location `path`,
+    # LocalStore (zarr 3) names it `root`.
+    root = getattr(store, "path", None) or getattr(store, "root", None) or store
+    root = str(root).rstrip("/")
+    return f"{root}/{node.path}" if node.path else root
+
+
+class ZarrArrayInspector(_StoredArrayInspector):
+    CLASS_QNAME = _ZARR_ARRAY_QNAMES
+    LIBRARY = "zarr"
+    STORE = "Store"
+
+    def _is_remote(self) -> bool:
+        return _zarr_is_remote(self.value)
+
+    def _dims(self) -> list[str] | None:
+        return _zarr_dims(self.value)
+
+    def _metadata(self) -> dict[str, str]:
+        array = self.value
+        chunks = f"{array.chunks}, {_count(array.nchunks, 'chunk')}"
+        shards = getattr(array, "shards", None)  # zarr 3
+        if shards is not None:
+            chunks += f", in shards of {shards}"
+        compressors = getattr(array, "compressors", None)  # zarr 3
+        if compressors is None:
+            compressors = () if array.compressor is None else (array.compressor,)
+        codecs = [*(array.filters or ()), *compressors]
+        return {
+            self.CHUNKS: chunks,
+            self.COMPRESSION: ", ".join(repr(codec) for codec in codecs) or "none",
+            self.STORE: _zarr_location(array),
+        }
+
+    # Compared by identity. Comparing contents after every execution would read the store, which
+    # can be remote. A row refreshes when its variable is reassigned.
+    def is_mutable(self) -> bool:
+        return False
+
+
+class ZarrGroupInspector(_StoredGroupInspector):
+    CLASS_QNAME = _ZARR_GROUP_QNAMES
+    LIBRARY = "zarr"
+
+    def _is_remote(self) -> bool:
+        return _zarr_is_remote(self.value)
+
+    # Compared by identity, like ZarrArrayInspector. Listing the members of a remote store without
+    # consolidated metadata takes a request per listing.
+    def is_mutable(self) -> bool:
+        return False
+
+
+class H5pyDatasetInspector(_StoredArrayInspector):
+    """
+    An HDF5 dataset.
+
+    h5py objects are mutable and cannot be copied, so the Variables pane summarizes them again
+    after every execution. A file closed by a `with` block then shows as closed. HDF5 files are
+    local, so that reads only metadata from disk.
+    """
+
+    CLASS_QNAME = _H5PY_DATASET_QNAMES
+    LIBRARY = "h5py"
+    FILE = "File"
+
+    def _is_open(self) -> bool:
+        # A dataset of a closed file is falsy, and reading its metadata raises.
+        return bool(self.value)
+
+    def _dims(self) -> list[str] | None:
+        return _h5py_dims(self.value)
+
+    def _metadata(self) -> dict[str, str]:
+        dataset = self.value
+        if dataset.chunks is None:
+            chunks = "none (contiguous)"
+        else:
+            count = math.prod(
+                math.ceil(size / chunk) for size, chunk in zip(dataset.shape, dataset.chunks)
+            )
+            chunks = f"{dataset.chunks}, {_count(count, 'chunk')}"
+        filters = []
+        if dataset.compression is not None:
+            options = dataset.compression_opts
+            filters.append(dataset.compression + ("" if options is None else f" ({options})"))
+        if dataset.shuffle:
+            filters.append("shuffle")
+        if dataset.scaleoffset is not None:
+            filters.append(f"scale-offset ({dataset.scaleoffset})")
+        if dataset.fletcher32:
+            filters.append("fletcher32 checksum")
+        return {
+            self.CHUNKS: chunks,
+            self.COMPRESSION: ", ".join(filters) or "none",
+            self.FILE: dataset.file.filename,
+        }
+
+
+class H5pyGroupInspector(_StoredGroupInspector):
+    """An HDF5 file or group. See H5pyDatasetInspector for how changes are detected."""
+
+    CLASS_QNAME = _H5PY_GROUP_QNAMES
+    LIBRARY = "h5py"
+
+    def _is_open(self) -> bool:
+        # A closed file and its groups are falsy, and listing their members raises.
+        return bool(self.value)
+
+    def _member(self, name: str) -> Any:
+        group = self.value
+        link = group.get(name, getlink=True)
+        if link is None:
+            raise KeyError(name)
+        if isinstance(link, sys.modules["h5py"].ExternalLink):
+            # Following an external link would open another file.
+            return MetadataRow(f"external link to {link.filename}:{link.path}")
+        # Soft links resolve within the same file. A soft link to a missing path resolves to None.
+        member = group.get(name)
+        if member is None:
+            return MetadataRow(f"broken link to {link.path}")
+        return member
+
+
 INSPECTOR_CLASSES: dict[str, type[PositronInspector]] = {
     # xarray inspectors and their child rows
     **dict.fromkeys(XarrayDatasetInspector.CLASS_QNAME, XarrayDatasetInspector),
     **dict.fromkeys(XarrayDataArrayInspector.CLASS_QNAME, XarrayDataArrayInspector),
     **dict.fromkeys(XarrayVariableInspector.CLASS_QNAME, XarrayVariableInspector),
     **dict.fromkeys(DaskArrayInspector.CLASS_QNAME, DaskArrayInspector),
+    # zarr and h5py inspectors
+    **dict.fromkeys(ZarrArrayInspector.CLASS_QNAME, ZarrArrayInspector),
+    **dict.fromkeys(ZarrGroupInspector.CLASS_QNAME, ZarrGroupInspector),
+    **dict.fromkeys(H5pyDatasetInspector.CLASS_QNAME, H5pyDatasetInspector),
+    **dict.fromkeys(H5pyGroupInspector.CLASS_QNAME, H5pyGroupInspector),
     get_qualname(MetadataRow): MetadataRowInspector,
     get_qualname(ArrayGroup): ArrayGroupInspector,
     # Geopandas inspectors (before pandas to take precedence)

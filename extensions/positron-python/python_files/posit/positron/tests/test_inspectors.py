@@ -582,18 +582,18 @@ def test_inspect_property(value: property) -> None:
 
 
 @pytest.mark.parametrize(
-    "value",
+    ("value", "display_value"),
     [
-        np.array([1, 2, 3], dtype=np.int64),  # 1D
-        np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int64),  # 2D
+        (np.array([1, 2, 3], dtype=np.int64), "[1, 2, 3]"),  # 1D
+        (np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int64), "[[1, 2, 3], [4, 5, 6]]"),  # 2D
     ],
 )
-def test_inspect_numpy_array(value: np.ndarray) -> None:
+def test_inspect_numpy_array(value: np.ndarray, display_value: str) -> None:
     shape = value.shape
     display_shape = f"({shape[0]})" if len(shape) == 1 else str(tuple(shape))
     verify_inspector(
         value=value,
-        display_value=np.array2string(value, separator=","),
+        display_value=display_value,
         kind=VariableKind.Table,
         display_type=f"numpy.int64 {display_shape}",
         type_info="numpy.ndarray",
@@ -606,11 +606,30 @@ def test_inspect_numpy_array(value: np.ndarray) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("value", "display_value"),
+    [
+        # float32 items show the digits float32 resolves, without padding to a common width
+        (np.array([28.02, 27.89, 27.77], dtype=np.float32), "[28.02, 27.89, 27.77]"),
+        (np.array([[1.5, 22.25], [3.0, 4.125]]), "[[1.5, 22.25], [3.0, 4.125]]"),
+        (np.array(["a", "bb"]), "['a', 'bb']"),
+        (np.array([True, False]), "[True, False]"),
+    ],
+)
+def test_numpy_array_display_value(value: np.ndarray, display_value: str) -> None:
+    assert get_inspector(value).get_display_value() == (display_value, True)
+
+
+def test_numpy_array_display_value_summarizes_large_arrays() -> None:
+    text, _ = get_inspector(np.arange(100, dtype=np.int64)).get_display_value()
+    assert text == "[0, 1, 2, 3, 4, 5, 6, 7, 8, ..., 91, 92, 93, 94, 95, 96, 97, 98, 99]"
+
+
 def test_inspect_numpy_array_3d() -> None:
     value = np.arange(8, dtype=np.int64).reshape(2, 2, 2)
     verify_inspector(
         value=value,
-        display_value=np.array2string(value, separator=","),
+        display_value="[[[0, 1], [2, 3]], [[4, 5], [6, 7]]]",
         kind=VariableKind.Collection,
         display_type="numpy.int64 (2, 2, 2)",
         type_info="numpy.ndarray",
@@ -632,7 +651,7 @@ def test_inspect_numpy_array_3d() -> None:
 def test_inspect_numpy_array_0d(value: np.ndarray) -> None:
     verify_inspector(
         value=value,
-        display_value=np.array2string(value, separator=","),
+        display_value="1",
         kind=VariableKind.Number,
         display_type="numpy.int64",
         type_info="numpy.ndarray",
