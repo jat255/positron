@@ -32,9 +32,14 @@ if TYPE_CHECKING:
     import zarr
 else:
     zarr = pytest.importorskip("zarr")
-    h5py = pytest.importorskip("h5py")
+    # h5py has no wheels for some Python versions, so only the h5py tests need it.
+    try:
+        import h5py
+    except ImportError:
+        h5py = None
 
 ZARR_3 = int(zarr.__version__.split(".")[0]) >= 3
+requires_h5py = pytest.mark.skipif(h5py is None, reason="h5py is not installed")
 
 
 def _walk(value: Any, depth: int = 0) -> int:
@@ -187,6 +192,8 @@ def test_zarr_rows_resolve_by_access_key(zarr_group):
 
 @pytest.fixture
 def h5_file(tmp_path: Path) -> Any:
+    if h5py is None:
+        pytest.skip("h5py is not installed")
     path = tmp_path / "data.h5"
     with h5py.File(path, "w") as f:
         f.attrs["title"] = "sea surface temperature"
@@ -254,6 +261,7 @@ def test_h5py_dimension_scale_names_its_dim(h5_file):
     assert get_inspector(h5_file["time"]).get_display_value()[0] == "[time: 10] h5py.Dataset"
 
 
+@requires_h5py
 def test_h5py_closed_file(tmp_path):
     path = tmp_path / "closed.h5"
     with h5py.File(path, "w") as f:
@@ -266,6 +274,7 @@ def test_h5py_closed_file(tmp_path):
         assert not ins.has_children()
 
 
+@requires_h5py
 def test_h5py_links(tmp_path):
     path = tmp_path / "links.h5"
     with h5py.File(path, "w") as f:
@@ -293,9 +302,9 @@ def test_h5py_inspection_reads_metadata_only(h5_file, mocker):
 
 
 @pytest.mark.parametrize("kind", ["zarr", "h5py"])
-def test_group_is_listed_once_per_summary(kind, zarr_group, h5_file, mocker):
+def test_group_is_listed_once_per_summary(kind, request, mocker):
     # Listing a remote zarr store without consolidated metadata takes a request.
-    group = zarr_group if kind == "zarr" else h5_file
+    group = request.getfixturevalue("zarr_group" if kind == "zarr" else "h5_file")
     keys = mocker.spy(type(group), "keys")
     summaries = _summarize_children(group)
     assert len(summaries) == len(list(get_inspector(group).get_children()))

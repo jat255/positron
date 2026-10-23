@@ -10,7 +10,7 @@ dependencies = [
     "fastcore",
     "geopandas",
     "google-cloud-bigquery",
-    "h5py",
+    "h5py ; python_full_version < '3.15'",
     "haystack-ai",
     "holoviews>=1.20",
     "hvplot",
