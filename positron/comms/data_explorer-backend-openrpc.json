@@ -523,6 +523,14 @@
 							"items": {
 								"type": "string"
 							}
+						},
+						"row_axis_name": {
+							"type": "string",
+							"description": "Name of the dimension the rows are indexed by, shown in the grid corner (e.g. an xarray dimension name)"
+						},
+						"column_axis_name": {
+							"type": "string",
+							"description": "Name of the dimension the columns are indexed by, shown in the grid corner"
 						}
 					}
 				}

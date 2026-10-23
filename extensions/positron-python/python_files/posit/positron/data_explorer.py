@@ -3130,6 +3130,8 @@ class _ArrayTable:
         name: str | None,
         mask: np.ndarray | None = None,
         label_units: str | None = None,
+        row_axis_name: str | None = None,
+        row_axis_units: str | None = None,
     ):
         self.values = values
         # 2-D boolean array, True where a cell is masked (missing), or None
@@ -3142,6 +3144,10 @@ class _ArrayTable:
         self.name = name
         # The `units` attr of the column dim's coordinate (2-D) or of the array itself (1-D)
         self.label_units = label_units
+        # The dim the rows run along, named in the grid corner, or None
+        self.row_axis_name = row_axis_name
+        # The `units` attr of the row dim's coordinate, shown after the row axis name, or None
+        self.row_axis_units = row_axis_units
 
     def __len__(self) -> int:
         return self.shape[0]
@@ -3157,7 +3163,13 @@ class _ArrayTable:
 
         mask = None
         label_units = None
+        row_axis_name = None
+        row_axis_units = None
         xr_module = sys.modules.get("xarray")
+        if xr_module is not None and isinstance(value, xr_module.IndexVariable):
+            # An IndexVariable holds the values of its dim's coordinate, so its units are those
+            # of the row axis.
+            row_axis_units = cls._units(value)
         if xr_module is not None and isinstance(value, xr_module.Variable):
             # A DataArray without coordinates or a name shows a Variable's dims and attrs. It
             # wraps the Variable's data without loading it. The base Variable of an
@@ -3169,15 +3181,18 @@ class _ArrayTable:
             dims = tuple(str(dim) for dim in value.dims)
             name = None if value.name is None else str(value.name)
             row_dim = value.dims[0]
-            if row_dim not in value.coords or (
-                value.ndim == 1 and _is_own_coordinate(value, row_dim)
-            ):
+            is_own_coordinate = value.ndim == 1 and _is_own_coordinate(value, row_dim)
+            # A DataArray that is its own dim's coordinate already names that dim in its single
+            # column, so the corner leaves the row axis unnamed.
+            row_axis_name = None if is_own_coordinate else str(row_dim)
+            if row_dim not in value.coords or is_own_coordinate:
                 # Without a row coordinate, index positions would repeat the grid's row numbers.
                 # A DataArray that is its own dim's coordinate (for example ds.time) would
                 # repeat each row's value. The grid shows its row numbers in both cases.
                 row_labels = None
             else:
                 row_labels = cls._dim_labels(value, row_dim)
+                row_axis_units = cls._units(value.coords[row_dim])
             if value.ndim == 1:
                 columns = ["0" if name is None else name]
             else:
@@ -3203,7 +3218,17 @@ class _ArrayTable:
             values = values.reshape(-1, 1)
             if mask is not None:
                 mask = mask.reshape(-1, 1)
-        return cls(values, columns, row_labels, dims, name, mask, label_units)
+        return cls(
+            values,
+            columns,
+            row_labels,
+            dims,
+            name,
+            mask,
+            label_units,
+            row_axis_name,
+            row_axis_units,
+        )
 
     def column_label(self, column_index: int) -> str | None:
         """
@@ -3239,6 +3264,13 @@ class _ArrayTable:
             to_str = _datetime64_formatter() if labels.dtype.kind == "M" else str
             return [to_str(label) for label in labels]
         return [str(i) for i in range(data_array.sizes[dim])]
+
+
+def _axis_name_with_units(name: str | None, units: str | None) -> str | None:
+    """An axis name for the grid corner, followed by its units when known, as in "lon (degrees_east)"."""
+    if name is None or units is None:
+        return name
+    return f"{name} ({units})"
 
 
 _ARRAY_DTYPE_KIND_DISPLAY = MappingProxyType(
@@ -3483,14 +3515,22 @@ class ArrayView(DataExplorerTableView):
 
     def get_state(self, _unused):
         state = super().get_state(_unused)
-        if self.table.dims:
-            state.display_name = f"{self.state.name} ({', '.join(self.table.dims)})"
+        dims = self.table.dims
+        if dims:
+            state.display_name = f"{self.state.name} ({', '.join(dims)})"
+            # The grid corner names the dims that index its rows and (for 2-D) its columns, each
+            # followed by the units of its coordinate, as in "lat (degrees_north)".
+            state.row_axis_name = _axis_name_with_units(
+                self.table.row_axis_name, self.table.row_axis_units
+            )
+            if len(dims) > 1:
+                state.column_axis_name = _axis_name_with_units(dims[1], self.table.label_units)
         return state
 
     def get_updated_state(self, new_table) -> StateUpdate:
         # Arrays have no sort keys or filters to carry over. The schema is unchanged when the
         # shape, dtype, column names, row labels, dims (which the title names), and the units in
-        # the column labels all match, so only the data needs a refresh.
+        # the column labels and the grid corner all match, so only the data needs a refresh.
         new_table = _ArrayTable.from_value(new_table)
         old_table = self.table
         schema_updated = (
@@ -3500,6 +3540,7 @@ class ArrayView(DataExplorerTableView):
             or new_table.row_labels != old_table.row_labels
             or new_table.dims != old_table.dims
             or new_table.label_units != old_table.label_units
+            or new_table.row_axis_units != old_table.row_axis_units
         )
         return schema_updated, DataExplorerState(self.state.name)
 

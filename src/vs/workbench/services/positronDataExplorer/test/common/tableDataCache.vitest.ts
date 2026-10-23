@@ -247,6 +247,47 @@ describe('TableDataCache', () => {
 		await expect(cache.calculateColumnWidths(50, 400)).resolves.toEqual([100, 100]);
 	});
 
+	it('exposes the axis names the backend state reports', async () => {
+		ensureNoLeakedDisposables();
+
+		// An xarray DataArray names the dims its rows and columns are indexed by, which the grid
+		// corner shows.
+		getBackendState.mockResolvedValue({ ...backendState(true), row_axis_name: 'lat', column_axis_name: 'lon' });
+
+		await cache.update({ invalidateCache: InvalidateCacheFlags.Data, columnIndices: [0, 1], rowIndices: [0, 1] });
+
+		expect({ row: cache.rowAxisName, column: cache.columnAxisName }).toEqual({ row: 'lat', column: 'lon' });
+	});
+
+	it('clears the axis names when a later backend state omits them', async () => {
+		ensureNoLeakedDisposables();
+
+		// A variable reassigned from a DataArray to a DataFrame reports no axis names, and the corner
+		// must not keep showing the old ones.
+		getBackendState.mockResolvedValueOnce({ ...backendState(true), row_axis_name: 'lat', column_axis_name: 'lon' });
+		await cache.update({ invalidateCache: InvalidateCacheFlags.Data, columnIndices: [0, 1], rowIndices: [0, 1] });
+
+		await cache.update({ invalidateCache: InvalidateCacheFlags.Data, columnIndices: [0, 1], rowIndices: [0, 1] });
+
+		expect({ row: cache.rowAxisName, column: cache.columnAxisName }).toEqual({ row: undefined, column: undefined });
+	});
+
+	it('reads null axis names as absent', async () => {
+		ensureNoLeakedDisposables();
+
+		// The Python kernel serializes an unset optional field as null, not by leaving it out. A 1-D
+		// array has a row axis and no column axis, and the column name must read as absent.
+		getBackendState.mockResolvedValue({
+			...backendState(true),
+			row_axis_name: 'time',
+			column_axis_name: null as unknown as undefined
+		});
+
+		await cache.update({ invalidateCache: InvalidateCacheFlags.Data, columnIndices: [0, 1], rowIndices: [0, 1] });
+
+		expect({ row: cache.rowAxisName, column: cache.columnAxisName }).toEqual({ row: 'time', column: undefined });
+	});
+
 	it('does not request row labels when the row selection is empty', async () => {
 		ensureNoLeakedDisposables();
 

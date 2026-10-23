@@ -42,17 +42,30 @@ export const DataGridCornerTopLeft = (props: DataGridCornerTopLeftProps) => {
 		'Scroll to top-left'
 	);
 
+	// The instance's corner content, if it supplies any.
+	const content = context.instance.cornerTopLeft();
+
+	// Corner content shows its own hover, so the "Scroll to top-left" tooltip appears only on an
+	// empty corner.
+	const showScrollTooltip = !content;
+
 	// Render.
 	return (
+		// eslint-disable-next-line jsx-a11y/no-static-element-interactions -- mouse shortcut; keyboard users reach the top left with Cmd/Ctrl+Home, which the grid handles.
 		<div
 			ref={containerRef}
 			className='data-grid-corner-top-left'
-			title={!hoverManager ? tooltipText : undefined}
+			title={showScrollTooltip && !hoverManager ? tooltipText : undefined}
 			onClick={props.onClick}
-			onMouseLeave={hoverManager ? () => hoverManager.hideHover() : undefined}
-			onMouseOver={hoverManager ? () => hoverManager.showHover(containerRef.current, tooltipText) : undefined}
+			onMouseLeave={showScrollTooltip && hoverManager ? () => hoverManager.hideHover() : undefined}
+			onMouseOver={showScrollTooltip && hoverManager ? () => hoverManager.showHover(containerRef.current, tooltipText) : undefined}
 		>
 			<div className='border-overlay' />
+			{content &&
+				<div className='content' data-testid='data-grid-corner-top-left-content'>
+					{content}
+				</div>
+			}
 			<VerticalSplitter
 				onBeginResize={() => ({
 					minimumWidth: 20,

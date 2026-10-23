@@ -67,6 +67,8 @@ def test_array_view_numpy_2d(dxf: DataExplorerFixture):
     assert (state["table_shape"]["num_rows"], state["table_shape"]["num_columns"]) == (2, 3)
     assert state["display_name"] == "arr"
     assert not state["has_row_labels"]
+    assert state.get("row_axis_name") is None
+    assert state.get("column_axis_name") is None
     schema = dxf.get_schema("arr")
     assert [c["column_name"] for c in schema] == ["0", "1", "2"]
     assert schema[0]["type_display"] == "integer"
@@ -80,12 +82,39 @@ def test_array_view_dataarray_2d(dxf: DataExplorerFixture):
     state = dxf.get_state("sst")
     assert state["display_name"] == "sst (lat, lon)"
     assert state["has_row_labels"]
+    assert state["row_axis_name"] == "lat"
+    assert state["column_axis_name"] == "lon"
     schema = dxf.get_schema("sst")
     assert [c["column_name"] for c in schema] == [str(v) for v in da.lon.to_numpy()]
     assert schema[0]["type_display"] == "floating"
     num_rows = da.sizes["lat"]
     assert _row_labels(dxf, "sst", num_rows) == [str(v) for v in da.lat.to_numpy()]
     assert _column_values(dxf, "sst", 1, num_rows) == ["1.00", "6.00", "11.00"]
+
+
+def test_array_view_corner_names_units(dxf: DataExplorerFixture):
+    da = make_dataset()["sst"].isel(time=0)
+    da.lat.attrs["units"] = "degrees_north"
+    da.lon.attrs["units"] = "degrees_east"
+    dxf.register_table("sst", da)
+    state = dxf.get_state("sst")
+    assert (state["row_axis_name"], state["column_axis_name"]) == (
+        "lat (degrees_north)",
+        "lon (degrees_east)",
+    )
+    # The title names the dims alone.
+    assert state["display_name"] == "sst (lat, lon)"
+
+
+def test_array_view_index_variable_units(dxf: DataExplorerFixture):
+    ds = make_dataset()
+    ds.lat.attrs["units"] = "degrees_north"
+    dxf.register_table("lat", ds.variables["lat"])
+    assert dxf.get_state("lat")["row_axis_name"] == "lat (degrees_north)"
+    # A Variable that is not a coordinate has no row axis units.
+    ds.sst.attrs["units"] = "degC"
+    dxf.register_table("v", ds.variables["sst"].isel(time=0))
+    assert dxf.get_state("v")["row_axis_name"] == "lat"
 
 
 def test_array_view_dataarray_2d_without_coordinates(dxf: DataExplorerFixture):
@@ -108,7 +137,49 @@ def test_array_view_1d(dxf: DataExplorerFixture):
     dxf.register_table("lat", lat)
     state = dxf.get_state("lat")
     assert state["display_name"] == "lat (lat)"
+    # ds.lat is its own dim coordinate: its column already names the dim, so the corner does not.
+    assert state.get("row_axis_name") is None
+    assert state.get("column_axis_name") is None
     assert [c["column_name"] for c in dxf.get_schema("lat")] == ["lat"]
+
+
+def test_array_view_axis_names_1d(dxf: DataExplorerFixture):
+    ds = make_dataset()
+    # The time coordinate itself: no axis names, since its column is already named "time".
+    dxf.register_table("time", ds["time"])
+    state = dxf.get_state("time")
+    assert state.get("row_axis_name") is None
+    assert state.get("column_axis_name") is None
+
+    # A data variable along time: the rows run along time.
+    dxf.register_table("point", ds["sst"].isel(lat=0, lon=0))
+    state = dxf.get_state("point")
+    assert state["row_axis_name"] == "time"
+    assert state.get("column_axis_name") is None
+
+
+def test_array_view_axis_names_without_row_coordinate(dxf: DataExplorerFixture):
+    xr = pytest.importorskip("xarray")
+    # Rows without a coordinate show row numbers, but the name still says what they run along.
+    dxf.register_table("z", xr.DataArray(np.zeros((2, 3)), dims=("y", "x"), name="z"))
+    state = dxf.get_state("z")
+    assert (state["row_axis_name"], state["column_axis_name"]) == ("y", "x")
+
+    dxf.register_table("v", xr.DataArray(np.zeros(2), dims=("y",), name="v"))
+    assert dxf.get_state("v")["row_axis_name"] == "y"
+
+
+def test_array_view_axis_names_of_variables(dxf: DataExplorerFixture):
+    ds = make_dataset()
+    dxf.register_table("grid", ds.variables["sst"][0])
+    state = dxf.get_state("grid")
+    assert (state["row_axis_name"], state["column_axis_name"]) == ("lat", "lon")
+
+    # An unnamed IndexVariable's column is "0", so the corner names the dim its rows run along.
+    dxf.register_table("t", ds.variables["time"])
+    state = dxf.get_state("t")
+    assert state["row_axis_name"] == "time"
+    assert state.get("column_axis_name") is None
 
 
 def test_array_view_datetime_1d(dxf: DataExplorerFixture):
@@ -172,6 +243,8 @@ def test_array_view_dask_under_limit(dxf: DataExplorerFixture):
     dxf.register_table("lazy", lazy)
     state = dxf.get_state("lazy")
     assert (state["table_shape"]["num_rows"], state["table_shape"]["num_columns"]) == (4, 3)
+    assert state.get("row_axis_name") is None
+    assert state.get("column_axis_name") is None
     assert _column_values(dxf, "lazy", 2, 4) == ["2", "5", "8", "11"]
 
 

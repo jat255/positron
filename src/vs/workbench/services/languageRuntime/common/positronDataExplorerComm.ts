@@ -162,6 +162,18 @@ export interface BackendState {
 	 */
 	available_sheets?: Array<string>;
 
+	/**
+	 * Name of the dimension the rows are indexed by, shown in the grid
+	 * corner (e.g. an xarray dimension name)
+	 */
+	row_axis_name?: string;
+
+	/**
+	 * Name of the dimension the columns are indexed by, shown in the grid
+	 * corner
+	 */
+	column_axis_name?: string;
+
 }
 
 /**

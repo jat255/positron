@@ -367,6 +367,16 @@ class BackendState(BaseModel):
         description="For Excel workbooks, the names of the worksheets available to read, in workbook order. Absent for non-Excel data sources.",
     )
 
+    row_axis_name: Optional[StrictStr] = Field(
+        default=None,
+        description="Name of the dimension the rows are indexed by, shown in the grid corner (e.g. an xarray dimension name)",
+    )
+
+    column_axis_name: Optional[StrictStr] = Field(
+        default=None,
+        description="Name of the dimension the columns are indexed by, shown in the grid corner",
+    )
+
 
 class ColumnSchema(BaseModel):
     """

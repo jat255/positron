@@ -48,11 +48,13 @@ const WIDER_COLUMN_WIDTH = 456;
 const STALE_COLUMN_WIDTH = 111;
 
 /**
- * Builds a backend state. The instance reads the table shape, the sort keys, and the supported
- * features from it, so the rest is filler.
+ * Builds a backend state. The instance reads the table shape, the sort keys, the supported
+ * features, and the axis names from it, so the rest is filler.
+ * @param overrides Fields to set on top of the defaults, such as the axis names.
  */
-function backendState(): BackendState {
+function backendState(overrides: Partial<BackendState> = {}): BackendState {
 	return {
+		...overrides,
 		display_name: 'test-table',
 		table_shape: { num_rows: 100, num_columns: 2 },
 		table_unfiltered_shape: { num_rows: 100, num_columns: 2 },
@@ -315,6 +317,41 @@ describe('TableDataDataGridInstance', () => {
 			synchronized: 1,
 			notified: ['Unable to apply the filters: connection refused'],
 			setRowFiltersEvents: 0,
+		});
+	});
+
+	describe('cornerTopLeft', () => {
+		it('leaves the corner blank when the backend names no axes', async () => {
+			// Data frames and every other non-xarray backend report no axis names, and their corner
+			// must look as it always has.
+			await instance.setVisible(true);
+
+			expect(instance.cornerTopLeft()).toBeUndefined();
+		});
+
+		it('leaves the corner blank when the backend sends null axis names', async () => {
+			// The Python kernel sends unset optional fields as null.
+			getBackendState.mockResolvedValue(backendState({
+				row_axis_name: null as unknown as undefined,
+				column_axis_name: null as unknown as undefined
+			}));
+			await instance.setVisible(true);
+
+			expect(instance.cornerTopLeft()).toBeUndefined();
+		});
+
+		it('names the axes the backend reports', async () => {
+			getBackendState.mockResolvedValue(backendState({ row_axis_name: 'lat', column_axis_name: 'lon' }));
+			await instance.setVisible(true);
+
+			expect(instance.cornerTopLeft()?.props).toMatchObject({ rowAxisName: 'lat', columnAxisName: 'lon' });
+		});
+
+		it('names only the row axis of a one-dimensional array', async () => {
+			getBackendState.mockResolvedValue(backendState({ row_axis_name: 'time' }));
+			await instance.setVisible(true);
+
+			expect(instance.cornerTopLeft()?.props).toMatchObject({ rowAxisName: 'time', columnAxisName: undefined });
 		});
 	});
 });
