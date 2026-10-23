@@ -19,7 +19,9 @@ except ImportError:
 
 
 try:
-    if "SNOWFLAKE_ACCOUNT" in os.environ:
+    # CI sets SNOWFLAKE_ACCOUNT to an empty string when the secret is unavailable
+    # (for example, in a fork), so skip the tests unless it has a value.
+    if os.environ.get("SNOWFLAKE_ACCOUNT"):
         import snowflake.connector
 
         HAS_SNOWFLAKE = True
