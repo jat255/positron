@@ -116,7 +116,12 @@ from .inspectors import (
     _dask_variables,
     _format_name_list,
     _format_nbytes,
+    _hyperspy_array_axes,
+    _hyperspy_axis_labels,
+    _hyperspy_text,
+    _hyperspy_title,
     _is_dask_array,
+    _is_hyperspy_signal,
     _is_own_coordinate,
     _is_stored_array,
     _stored_array_dims,
@@ -2942,7 +2947,7 @@ class IbisView(PandasView):
 
 # ----------------------------------------------------------------------
 # Array Data Explorer RPC implementations for 1-D and 2-D numpy, xarray, dask, zarr, and h5py
-# arrays
+# arrays, and HyperSpy signals
 
 # Opening an array view loads its values into memory. That computes a dask-backed array and reads
 # a lazily indexed one (for example a variable opened from a file without chunks), a zarr array, or
@@ -3002,7 +3007,13 @@ def _is_lazy_object_array(value: Any, nbytes: int | None) -> bool:
 
 
 def _is_viewable_array(value: Any) -> bool:
-    """Whether value is one of the arrays that _is_array accepts, with 1 or 2 dims."""
+    """
+    Whether value is one of the arrays that _is_array accepts, with 1 or 2 dims.
+
+    A HyperSpy signal is viewable when its data is, so with 1 or 2 axes in all.
+    """
+    if _is_hyperspy_signal(value):
+        value = value.data
     if not _is_array(value) or value.ndim not in (1, 2):
         return False
     if value.dtype.names is not None:
@@ -3039,10 +3050,16 @@ def _array_view_unavailable_message(value: Any, expr: str) -> str | None:
                 f"{_format_name_list(names)[0]}"
             )
         return f"{expr} is an xarray Dataset; view one of its variables, e.g. {command}"
+    signal = value if _is_hyperspy_signal(value) else None
+    if signal is not None:
+        # A signal opens as its data, so the data decides whether it can be viewed
+        value = signal.data
     if not _is_array(value):
         return None
     if value.ndim > 2:
-        example = None if node is None else _slice_example(value, node)
+        example = (
+            None if node is None else _slice_example(value if signal is None else signal, node)
+        )
         suggestion = "." if example is None else f", e.g. {example}"
         return (
             f"{expr} has {value.ndim} dimensions; the Data Explorer shows 1-D and 2-D arrays. "
@@ -3096,6 +3113,11 @@ def _literal_node(value: Any) -> ast.expr | None:
 
 def _slice_example(value: Any, node: ast.expr) -> str | None:
     """Code that selects the first slice along the first dim of value, which node evaluates to."""
+    if _is_hyperspy_signal(value):
+        # Navigation axes come first in HyperSpy's order; a signal without any is sliced by isig
+        attr = "inav" if value.axes_manager.navigation_dimension > 0 else "isig"
+        indexer = ast.Attribute(value=node, attr=attr, ctx=ast.Load())
+        return ast.unparse(ast.Subscript(value=indexer, slice=ast.Constant(0), ctx=ast.Load()))
     xr_module = sys.modules.get("xarray")
     if xr_module is None or not isinstance(value, (xr_module.DataArray, xr_module.Variable)):
         return ast.unparse(ast.Subscript(value=node, slice=ast.Constant(0), ctx=ast.Load()))
@@ -3184,6 +3206,8 @@ class _ArrayTable:
         row_axis_name = None
         row_axis_units = None
         xr_module = sys.modules.get("xarray")
+        if _is_hyperspy_signal(value):
+            return cls._from_hyperspy_signal(value)
         if _is_stored_array(value):
             stored = cls._from_stored_array(value)
             if stored is not None:
@@ -3279,6 +3303,50 @@ class _ArrayTable:
         # A 1-D dimension scale (a coordinate) names its dim in its single column already.
         row_axis_name = None if len(dims) == 1 and name == dims[0] else dims[0]
         return cls(values, columns, None, dims, name, row_axis_name=row_axis_name)
+
+    @classmethod
+    def _from_hyperspy_signal(cls, signal: Any) -> _ArrayTable:
+        """
+        The table of a HyperSpy signal with 1 or 2 axes in all.
+
+        The dims are the signal's axes in the order of its data, so the rows of a spectrum image
+        line are its navigation positions and the columns its signal axis. The rows and columns
+        are labeled with the calibrated values of their axes, and the corner names the dims.
+        """
+        import numpy as np
+
+        axes = _hyperspy_array_axes(signal)
+        # np.asarray computes the dask array of a lazy signal
+        values = np.asarray(signal.data)
+        dims = tuple(label for label, _ in axes)
+        name = _hyperspy_title(signal)
+        row_labels = cls._hyperspy_labels(axes[0][1])
+        label_units = None
+        if values.ndim == 1:
+            columns = ["0" if name is None else name]
+            values = values.reshape(-1, 1)
+        else:
+            column_axis = axes[1][1]
+            # Columns need names, so an uncalibrated axis uses index positions.
+            columns = cls._hyperspy_labels(column_axis) or [str(i) for i in range(column_axis.size)]
+            label_units = _hyperspy_text(column_axis.units)
+        # The corner names each axis with its units. An uncalibrated axis with units has a step of
+        # 1 from 0, so the grid's row numbers are positions in those units.
+        row_axis_units = _hyperspy_text(axes[0][1].units)
+        return cls(
+            values, columns, row_labels, dims, name, None, label_units, dims[0], row_axis_units
+        )
+
+    @staticmethod
+    def _hyperspy_labels(axis: Any) -> list[str] | None:
+        """
+        The calibrated values of a HyperSpy axis, or None for an uncalibrated axis.
+
+        An uncalibrated axis has a step of 1 from 0, so its values are the grid's row numbers.
+        """
+        if getattr(axis, "is_uniform", True) and axis.scale == 1 and axis.offset == 0:
+            return None
+        return _hyperspy_axis_labels(axis.axis)
 
     def column_label(self, column_index: int) -> str | None:
         """
